@@ -32,6 +32,18 @@
 #define ENEMY_MELEE_RANGE   0.5f
 #define ENEMY_SPAWN_MIN_DIST 3.0f  // don't spawn closer than this to the player
 #define ENEMY_AIM_TOLERANCE 0.15f  // radians -- forgiving hitscan cone
+#define ENEMY_FLIP_PERIOD   1.0f   // seconds per flip half-cycle (walk animation)
+
+#define MAX_DEATH_EFFECTS     8
+#define DEATH_EFFECT_DURATION 0.25f
+
+// NDSP channels -- one dedicated channel per sound so overlapping triggers
+// (e.g. firing again before the last shot's sound finished) just restart
+// that channel instead of needing a general-purpose mixer/voice pool.
+#define CH_MUSIC   0
+#define CH_GUNSHOT 1
+#define CH_RELOAD1 2
+#define CH_RELOAD2 3
 
 // 1 = wall, 0 = open floor. Kept tiny on purpose -- this is just enough
 // to prove out the raycaster and the reload mechanic, not a real level.
@@ -69,6 +81,7 @@ typedef enum { IMM_BASE, IMM_MEDIUM, IMM_FULL, IMM_COUNT } Immersion;
 typedef enum { SCREEN_MENU, SCREEN_PLAYING, SCREEN_GAMEOVER } GameScreen;
 
 typedef struct { float x, y; bool alive; } Enemy;
+typedef struct { float x, y; float timer; bool active; } DeathEffect;
 
 static const char* immersion_name(Immersion imm) {
 	switch (imm) {
@@ -82,6 +95,21 @@ static const char* immersion_name(Immersion imm) {
 typedef struct { u64 titleId; int ammo; } CartMag;
 static CartMag mags[MAX_TRACKED_CARTS];
 static int magCount = 0;
+
+// --- audio -----------------------------------------------------------
+// A WAV's raw PCM samples, loaded into linear memory (required for the DSP
+// to read them directly) plus the format info needed to configure an NDSP
+// channel to play them back correctly.
+typedef struct {
+	void* data;
+	u32   nsamples;   // frames, not bytes
+	u16   channels;
+	u32   sampleRate;
+} Sound;
+
+static Sound sounds[4];          // indexed by CH_* constants
+static ndspWaveBuf waveBufs[4];  // must outlive playback -- can't be a local
+static bool audioReady = false;
 
 // Finds the magazine for a given cartridge (by Title ID), creating a
 // freshly-full one the first time a cartridge is seen. If more than
@@ -113,6 +141,88 @@ static u64 read_cart_title_id(Result* outResult, u32* outTitlesRead) {
 	if (outTitlesRead) *outTitlesRead = titlesRead;
 	if (R_FAILED(r) || titlesRead == 0) return 0;
 	return titleId;
+}
+
+// Parses a WAV file's fmt/data chunks (tolerating whatever chunks come
+// before "data", which is all a typical encoder/converter needs) and
+// copies the raw PCM into a freshly linearAlloc'd buffer ready for NDSP.
+// 3DS homebrew apps run with a heap in the tens-of-MB range, nowhere near
+// enough for, say, an uncompressed full-length music track (a several
+// hundred MB WAV would blow the budget outright). Rather than let a
+// too-large file take its chances with malloc, reject it up front so
+// loading fails predictably instead of however OOM happens to behave.
+// 16MB is roughly 80s of 16-bit stereo 48kHz audio -- plenty for a
+// looping BGM clip.
+#define MAX_WAV_FILE_SIZE (16 * 1024 * 1024)
+
+static bool load_wav(const char* path, Sound* out) {
+	FILE* f = fopen(path, "rb");
+	if (!f) return false;
+	fseek(f, 0, SEEK_END);
+	long fileSize = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (fileSize <= 12 || fileSize > MAX_WAV_FILE_SIZE) { fclose(f); return false; }
+
+	u8* raw = (u8*)malloc(fileSize);
+	if (!raw) { fclose(f); return false; }
+	size_t readBytes = fread(raw, 1, fileSize, f);
+	fclose(f);
+	if ((long)readBytes != fileSize) { free(raw); return false; }
+
+	u16 fmtChannels = 2;
+	u32 fmtRate = 48000;
+	u16 fmtBits = 16;
+	long dataOffset = -1;
+	u32 dataSize = 0;
+
+	for (long i = 12; i + 8 <= fileSize; ) {
+		u32 chunkSize = raw[i+4] | (raw[i+5] << 8) | (raw[i+6] << 16) | ((u32)raw[i+7] << 24);
+		if (memcmp(raw + i, "fmt ", 4) == 0 && i + 8 + 16 <= fileSize) {
+			fmtChannels = raw[i+8+2] | (raw[i+8+3] << 8);
+			fmtRate = raw[i+8+4] | (raw[i+8+5] << 8) | (raw[i+8+6] << 16) | ((u32)raw[i+8+7] << 24);
+			fmtBits = raw[i+8+14] | (raw[i+8+15] << 8);
+		} else if (memcmp(raw + i, "data", 4) == 0) {
+			dataSize = chunkSize;
+			dataOffset = i + 8;
+			break;
+		}
+		i += 8 + chunkSize + (chunkSize & 1); // chunks are word-aligned
+	}
+	if (dataOffset < 0 || fmtChannels == 0 || fmtBits == 0) { free(raw); return false; }
+	if (dataOffset + (long)dataSize > fileSize) dataSize = (u32)(fileSize - dataOffset);
+
+	out->data = linearAlloc(dataSize);
+	if (!out->data) { free(raw); return false; }
+	memcpy(out->data, raw + dataOffset, dataSize);
+	free(raw);
+	DSP_FlushDataCache(out->data, dataSize);
+
+	out->channels = fmtChannels;
+	out->sampleRate = fmtRate;
+	out->nsamples = dataSize / ((fmtBits / 8) * fmtChannels);
+	return true;
+}
+
+static void setup_channel(int ch, const Sound* s) {
+	if (!audioReady || !s->data) return;
+	ndspChnReset(ch);
+	ndspChnSetInterp(ch, NDSP_INTERP_LINEAR);
+	ndspChnSetRate(ch, (float)s->sampleRate);
+	ndspChnSetFormat(ch, s->channels == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
+}
+
+static void play_sound(int ch, const Sound* s, bool loop) {
+	if (!audioReady || !s->data) return;
+	ndspChnWaveBufClear(ch);
+	memset(&waveBufs[ch], 0, sizeof(ndspWaveBuf));
+	waveBufs[ch].data_vaddr = s->data;
+	waveBufs[ch].nsamples = s->nsamples;
+	waveBufs[ch].looping = loop;
+	ndspChnWaveBufAdd(ch, &waveBufs[ch]);
+}
+
+static u32 random_wave_color(void) {
+	return C2D_Color32((u8)(rand() % 256), (u8)(rand() % 256), (u8)(rand() % 256), 255);
 }
 
 static int wall_is_solid(int x, int y) {
@@ -170,13 +280,26 @@ static int count_alive_enemies(Enemy* enemies) {
 	return n;
 }
 
+static void spawn_death_effect(DeathEffect* effects, float x, float y) {
+	for (int i = 0; i < MAX_DEATH_EFFECTS; i++) {
+		if (!effects[i].active) {
+			effects[i].x = x;
+			effects[i].y = y;
+			effects[i].timer = DEATH_EFFECT_DURATION;
+			effects[i].active = true;
+			return;
+		}
+	}
+	// all slots busy -- purely cosmetic, fine to just drop it
+}
+
 // width of each rendered strip in pixels -- one C2D_DrawImageAt call is
 // issued per strip, and citro3d's command buffer can't take 400 individual
 // draw calls in one frame (that's what caused earlier crashes), so we
 // cast fewer, wider rays instead of one per screen column.
 #define RENDER_STRIDE 4
 
-static void draw_frame(float px, float py, float pa, C2D_Image wallImg) {
+static void draw_frame(float px, float py, float pa, C2D_Image wallImg, u32 waveTintColor) {
 	for (int col = 0; col < SCREEN_W; col += RENDER_STRIDE) {
 		float rayAngle = (pa - FOV / 2.0f) + ((float)col / SCREEN_W) * FOV;
 		float rayDirX = cosf(rayAngle);
@@ -234,24 +357,31 @@ static void draw_frame(float px, float py, float pa, C2D_Image wallImg) {
 		strip.right = wallHit + (1.0f / (float)wallImg.subtex->width);
 		C2D_Image colImg = { wallImg.tex, &strip };
 
-		// distance + side shading, done as a tint-toward-black so the
-		// texture detail survives instead of flattening to a solid color
+		// distance + side shading, done as a tint-toward-a-color so the
+		// texture detail survives instead of flattening to a solid color.
+		// The tint target is this wave's random color instead of plain
+		// black, so far walls fade toward a wave-specific mood color
+		// while near walls still show mostly-true wall texture.
 		float darken = dist / MAX_DEPTH;
 		if (darken > 0.85f) darken = 0.85f;
 		if (side == 1) darken += (1.0f - darken) * 0.3f;
 		C2D_ImageTint tint;
-		C2D_PlainImageTint(&tint, C2D_Color32(0, 0, 0, 255), darken);
+		C2D_PlainImageTint(&tint, waveTintColor, darken);
 
 		C2D_DrawImageAt(colImg, (float)col, (float)drawStart, 0.5f, &tint,
 			(float)RENDER_STRIDE, (float)(drawEnd - drawStart) / (float)strip.height);
 	}
 }
 
-// Placeholder enemy rendering (flat red squares) -- no enemy art exists
-// yet. Angle-to-screen-X uses the same linear mapping draw_frame() uses
-// for wall columns (not a tangent-correct projection), so enemies line up
-// with the walls instead of drifting relative to them.
-static void draw_enemies(Enemy* enemies, float px, float py, float pa) {
+// Angle-to-screen-X uses the same linear mapping draw_frame() uses for
+// wall columns (not a tangent-correct projection), so billboarded sprites
+// line up with the walls instead of drifting relative to them.
+static float billboard_screen_x(float relAngle) {
+	return SCREEN_W * (relAngle + FOV / 2.0f) / FOV;
+}
+
+static void draw_enemies(Enemy* enemies, float px, float py, float pa, C2D_Image img, bool flipped) {
+	float aspect = (float)img.subtex->width / (float)img.subtex->height;
 	for (int i = 0; i < MAX_ENEMIES; i++) {
 		if (!enemies[i].alive) continue;
 
@@ -263,15 +393,42 @@ static void draw_enemies(Enemy* enemies, float px, float py, float pa) {
 		if (fabsf(relAngle) > FOV / 2.0f + 0.3f) continue; // cheap off-screen cull
 		if (!has_line_of_sight(px, py, enemies[i].x, enemies[i].y)) continue;
 
-		float screenX = SCREEN_W * (relAngle + FOV / 2.0f) / FOV;
-		float size = (SCREEN_H / dist) * 0.5f;
+		float screenX = billboard_screen_x(relAngle);
+		float height = (SCREEN_H / dist) * 0.5f;
+		float scale = height / (float)img.subtex->height;
+		float halfWidth = (height * aspect) / 2.0f;
 
 		float shade = 1.0f - dist / MAX_DEPTH;
 		if (shade < 0.2f) shade = 0.2f;
-		u32 color = C2D_Color32((u8)(220 * shade), (u8)(40 * shade), (u8)(40 * shade), 255);
+		C2D_ImageTint tint;
+		C2D_PlainImageTint(&tint, C2D_Color32(0, 0, 0, 255), 1.0f - shade);
 
-		C2D_DrawRectSolid(screenX - size / 2.0f, SCREEN_H / 2.0f - size / 2.0f, 0.52f,
-			size, size, color);
+		// flipping mirrors around the image's own left edge, so nudge the
+		// draw position to the right edge to keep the sprite centered on
+		// screenX either way
+		float drawX = flipped ? (screenX + halfWidth) : (screenX - halfWidth);
+		float drawScaleX = flipped ? -scale : scale;
+		C2D_DrawImageAt(img, drawX, SCREEN_H / 2.0f - height / 2.0f, 0.52f, &tint,
+			drawScaleX, scale);
+	}
+}
+
+static void draw_death_effects(DeathEffect* effects, float px, float py, float pa, C2D_Image img) {
+	for (int i = 0; i < MAX_DEATH_EFFECTS; i++) {
+		if (!effects[i].active) continue;
+
+		float dx = effects[i].x - px, dy = effects[i].y - py;
+		float dist = sqrtf(dx * dx + dy * dy);
+		if (dist >= 0.1f && dist <= MAX_DEPTH) {
+			float relAngle = normalize_angle(atan2f(dy, dx) - pa);
+			if (fabsf(relAngle) <= FOV / 2.0f + 0.3f && has_line_of_sight(px, py, effects[i].x, effects[i].y)) {
+				float screenX = billboard_screen_x(relAngle);
+				float height = (SCREEN_H / dist) * 1.1f; // bigger than an enemy -- a death poof, not a normal sprite
+				float scale = height / (float)img.subtex->height;
+				float drawX = screenX - (img.subtex->width * scale) / 2.0f;
+				C2D_DrawImageAt(img, drawX, SCREEN_H / 2.0f - height / 2.0f, 0.53f, NULL, scale, scale);
+			}
+		}
 	}
 }
 
@@ -279,12 +436,27 @@ int main(int argc, char **argv) {
 	gfxInitDefault();
 	// hid and fs are already brought up by libctru's default __appInit, so
 	// hidScanInput() and FSUSER_* calls work with no extra setup here. The
-	// C-stick and title lookups are separate services that do need their
-	// own init.
+	// C-stick, title lookups, and audio are separate services that do need
+	// their own init.
 	irrstInit();
 	amInit();
 	romfsInit();
+	audioReady = R_SUCCEEDED(ndspInit());
 	srand((unsigned int)svcGetSystemTick());
+
+	if (audioReady) {
+		// music is optional -- silently skipped if audio/music.wav doesn't
+		// exist yet, everything else still works
+		load_wav("romfs:/audio/music.wav", &sounds[CH_MUSIC]);
+		load_wav("romfs:/audio/gunshot.wav", &sounds[CH_GUNSHOT]);
+		load_wav("romfs:/audio/reload1.wav", &sounds[CH_RELOAD1]);
+		load_wav("romfs:/audio/reload2.wav", &sounds[CH_RELOAD2]);
+		setup_channel(CH_MUSIC, &sounds[CH_MUSIC]);
+		setup_channel(CH_GUNSHOT, &sounds[CH_GUNSHOT]);
+		setup_channel(CH_RELOAD1, &sounds[CH_RELOAD1]);
+		setup_channel(CH_RELOAD2, &sounds[CH_RELOAD2]);
+		play_sound(CH_MUSIC, &sounds[CH_MUSIC], true);
+	}
 
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 	C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
@@ -304,6 +476,8 @@ int main(int argc, char **argv) {
 	C2D_Image imgMuzzleflash  = C2D_SpriteSheetGetImage(uiSheet, sprites_muzzleflash_idx);
 	C2D_Image imgHudLoaded    = C2D_SpriteSheetGetImage(uiSheet, sprites_loadedgunonhud_idx);
 	C2D_Image imgHudUnloaded  = C2D_SpriteSheetGetImage(uiSheet, sprites_unloadedgunonhud_idx);
+	C2D_Image imgEnemy        = C2D_SpriteSheetGetImage(uiSheet, sprites_enemy_idx);
+	C2D_Image imgTitle        = C2D_SpriteSheetGetImage(uiSheet, sprites_title_idx);
 	C2D_Image imgWall         = C2D_SpriteSheetGetImage(wallSheet, walltex_idx);
 
 	C2D_TextBuf textBuf = C2D_TextBufNew(1024);
@@ -328,9 +502,12 @@ int main(int argc, char **argv) {
 	u64 lastReadTitleId = 0;
 
 	float muzzleFlashTimer = 0.0f;
+	float animClock = 0.0f;
 
 	Enemy enemies[MAX_ENEMIES];
 	memset(enemies, 0, sizeof(enemies));
+	DeathEffect deathEffects[MAX_DEATH_EFFECTS];
+	memset(deathEffects, 0, sizeof(deathEffects));
 	int health = PLAYER_MAX_HEALTH;
 	int wave = 1;
 	int kills = 0;
@@ -340,6 +517,7 @@ int main(int argc, char **argv) {
 	bool waveBreak = false;
 	float waveBreakTimer = 0.0f;
 	int finalWave = 0;
+	u32 waveTintColor = C2D_Color32(0, 0, 0, 255);
 
 	u64 lastTime = svcGetSystemTick();
 
@@ -369,7 +547,9 @@ int main(int argc, char **argv) {
 				enemiesSpawnedThisWave = 0;
 				spawnTimer = 1.0f;
 				waveBreak = false;
+				waveTintColor = random_wave_color();
 				memset(enemies, 0, sizeof(enemies));
+				memset(deathEffects, 0, sizeof(deathEffects));
 				magCount = 0; // full mode starts each run with fresh magazines
 				hasLoadedCart = false;
 				loadedCartId = 0;
@@ -378,9 +558,12 @@ int main(int argc, char **argv) {
 				gunState = STATE_RELOADING;
 				FSUSER_CardSlotIsInserted(&prevCardInserted);
 				muzzleFlashTimer = 0.0f;
+				animClock = 0.0f;
 				screen = SCREEN_PLAYING;
 			}
 		} else if (screen == SCREEN_PLAYING) {
+			animClock += dt;
+
 			// Circle Pad: move forward/back and strafe left/right.
 			circlePosition cpos;
 			hidCircleRead(&cpos);
@@ -424,6 +607,7 @@ int main(int argc, char **argv) {
 				// cart pulled (even mid-check) -- gun goes dead no matter how
 				// much ammo is left, or how far along a pending ID check was
 				gunState = STATE_RELOADING;
+				play_sound(CH_RELOAD1, &sounds[CH_RELOAD1], false);
 			} else if (gunState == STATE_RELOADING && !prevCardInserted && cardInserted) {
 				if (immersion == IMM_BASE) {
 					// base mode never needs to identify the cart, so it can
@@ -432,6 +616,7 @@ int main(int argc, char **argv) {
 					ammo = MAG_SIZE;
 					hasLoadedCart = true;
 					gunState = STATE_READY;
+					play_sound(CH_RELOAD2, &sounds[CH_RELOAD2], false);
 				} else {
 					// a cart just went back in, but AM_GetTitleList tends to
 					// come back empty if queried on the very same frame the
@@ -459,6 +644,7 @@ int main(int argc, char **argv) {
 						loadedCartId = newId;
 						hasLoadedCart = true;
 						gunState = STATE_READY;
+						play_sound(CH_RELOAD2, &sounds[CH_RELOAD2], false);
 					} else {
 						gunState = STATE_RELOADING;
 					}
@@ -470,6 +656,7 @@ int main(int argc, char **argv) {
 				ammo--;
 				if (immersion == IMM_FULL && loadedMagIdx >= 0) mags[loadedMagIdx].ammo = ammo;
 				muzzleFlashTimer = 0.08f;
+				play_sound(CH_GUNSHOT, &sounds[CH_GUNSHOT], false);
 
 				// hit the closest alive enemy roughly in front of the
 				// player, if there's a clear line of sight to it
@@ -489,9 +676,16 @@ int main(int argc, char **argv) {
 				if (bestIdx >= 0) {
 					enemies[bestIdx].alive = false;
 					kills++;
+					spawn_death_effect(deathEffects, enemies[bestIdx].x, enemies[bestIdx].y);
 				}
 			}
 			if (muzzleFlashTimer > 0.0f) muzzleFlashTimer -= dt;
+
+			for (int i = 0; i < MAX_DEATH_EFFECTS; i++) {
+				if (!deathEffects[i].active) continue;
+				deathEffects[i].timer -= dt;
+				if (deathEffects[i].timer <= 0.0f) deathEffects[i].active = false;
+			}
 
 			// --- waves ---
 			if (waveBreak) {
@@ -501,6 +695,7 @@ int main(int argc, char **argv) {
 					enemiesQuotaThisWave = 2 + wave;
 					enemiesSpawnedThisWave = 0;
 					waveBreak = false;
+					waveTintColor = random_wave_color();
 				}
 			} else if (enemiesSpawnedThisWave < enemiesQuotaThisWave) {
 				spawnTimer -= dt;
@@ -522,6 +717,7 @@ int main(int argc, char **argv) {
 				if (dist < ENEMY_MELEE_RANGE) {
 					enemies[i].alive = false;
 					health--;
+					spawn_death_effect(deathEffects, enemies[i].x, enemies[i].y);
 					if (health <= 0) {
 						finalWave = wave;
 						screen = SCREEN_GAMEOVER;
@@ -548,25 +744,26 @@ int main(int argc, char **argv) {
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 
 		if (screen == SCREEN_MENU) {
+			// top screen: the title art (already includes the "CART RIDGE"
+			// lettering, so no separately-drawn text over it)
 			C2D_TargetClear(top, C2D_Color32(10, 10, 20, 255));
 			C2D_SceneBegin(top);
-			C2D_TextBufClear(textBuf);
+			float titleScale = SCREEN_H / (float)imgTitle.subtex->height;
+			float titleDrawW = imgTitle.subtex->width * titleScale;
+			C2D_DrawImageAt(imgTitle, (SCREEN_W - titleDrawW) / 2.0f, 0.0f, 0.5f, NULL,
+				titleScale, titleScale);
 
-			C2D_Text titleText;
-			C2D_TextParse(&titleText, textBuf, "CART RIDGE");
-			C2D_TextOptimize(&titleText);
-			C2D_DrawText(&titleText, C2D_WithColor, 90.0f, 80.0f, 0.5f, 1.2f, 1.2f,
-				C2D_Color32(255, 255, 255, 255));
+			// bottom screen: tagline, immersion selector, controls
+			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
+			C2D_SceneBegin(bottom);
+			C2D_TextBufClear(textBuf);
 
 			C2D_Text subText;
 			C2D_TextParse(&subText, textBuf,
 				"Pull the cartridge to reload. Survive the waves.");
 			C2D_TextOptimize(&subText);
-			C2D_DrawText(&subText, C2D_WithColor, 40.0f, 140.0f, 0.5f, 0.5f, 0.5f,
+			C2D_DrawText(&subText, C2D_WithColor, 10.0f, 15.0f, 0.5f, 0.45f, 0.45f,
 				C2D_Color32(180, 180, 180, 255));
-
-			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
-			C2D_SceneBegin(bottom);
 
 			char line[64];
 			C2D_Text modeText;
@@ -586,12 +783,14 @@ int main(int argc, char **argv) {
 				C2D_Color32(200, 200, 200, 255));
 		} else if (screen == SCREEN_PLAYING) {
 			bool cardInserted = prevCardInserted; // set above this frame
+			bool enemiesFlipped = fmodf(animClock, ENEMY_FLIP_PERIOD * 2.0f) >= ENEMY_FLIP_PERIOD;
 
 			// top screen: the raycast view + enemies + viewmodel
 			C2D_TargetClear(top, C2D_Color32(10, 10, 15, 255));
 			C2D_SceneBegin(top);
-			draw_frame(px, py, pa, imgWall);
-			draw_enemies(enemies, px, py, pa);
+			draw_frame(px, py, pa, imgWall, waveTintColor);
+			draw_enemies(enemies, px, py, pa, imgEnemy, enemiesFlipped);
+			draw_death_effects(deathEffects, px, py, pa, imgMuzzleflash);
 
 			C2D_Image gunImg = (gunState != STATE_READY) ? imgGunEmpty
 				: (muzzleFlashTimer > 0.0f) ? imgGunShooting : imgGunIdle;
@@ -722,6 +921,11 @@ int main(int argc, char **argv) {
 
 		C3D_FrameEnd(0);
 	}
+
+	for (int i = 0; i < 4; i++) {
+		if (sounds[i].data) linearFree(sounds[i].data);
+	}
+	if (audioReady) ndspExit();
 
 	C2D_TextBufDelete(textBuf);
 	C2D_SpriteSheetFree(wallSheet);

@@ -24,8 +24,10 @@ SOURCES		:=	source
 DATA		:=	data
 INCLUDES	:=	include
 GRAPHICS	:=	gfx
+AUDIO		:=	audio
 ROMFS		:=	romfs
 GFXBUILD	:=	$(ROMFS)/gfx
+AUDIOBUILD	:=	$(ROMFS)/audio
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -63,6 +65,7 @@ export TOPDIR	:=	$(CURDIR)
 
 export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
 					$(foreach dir,$(GRAPHICS),$(CURDIR)/$(dir)) \
+					$(foreach dir,$(AUDIO),$(CURDIR)/$(dir)) \
 					$(foreach dir,$(DATA),$(CURDIR)/$(dir))
 
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
@@ -72,9 +75,11 @@ CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 GFXFILES	:=	$(foreach dir,$(GRAPHICS),$(notdir $(wildcard $(dir)/*.t3s)))
 BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+AUDIOFILES	:=	$(foreach dir,$(AUDIO),$(notdir $(wildcard $(dir)/*.wav)))
 
 export ROMFS_T3XFILES	:=	$(patsubst %.t3s,$(GFXBUILD)/%.t3x,$(GFXFILES))
 export T3XHFILES		:=	$(patsubst %.t3s,$(BUILD)/%.h,$(GFXFILES))
+export ROMFS_AUDIOFILES	:=	$(patsubst %,$(AUDIOBUILD)/%,$(AUDIOFILES))
 
 #---------------------------------------------------------------------------------
 # use CXX for linking C++ projects, CC for standard C
@@ -103,19 +108,40 @@ else
 endif
 # 3dsxtool requires --smdh whenever --romfs is passed (it crashes with
 # "Cannot open SMDH file!" otherwise), so build one via the %.smdh rule
-# from 3ds_rules using libctru's bundled default icon.
+# from 3ds_rules. Title/description/author feed that SMDH; the icon lookup
+# below picks up icon.png (or cart-ridge.png) from the project root or gfx/
+# automatically once one exists, falling back to libctru's generic icon.
 export _3DSXFLAGS += --smdh=$(OUTPUT).smdh
+export APP_TITLE       := Cart Ridge
+export APP_DESCRIPTION := Reload by swapping game cartridges
+export APP_AUTHOR      := bigtuna824
+
+ifeq ($(strip $(ICON)),)
+	icons := $(wildcard *.png) $(wildcard $(GRAPHICS)/*.png)
+	ifneq (,$(findstring $(TARGET).png,$(icons)))
+		export APP_ICON := $(TOPDIR)/$(TARGET).png
+	else
+		ifneq (,$(filter %icon.png,$(icons)))
+			export APP_ICON := $(TOPDIR)/$(firstword $(filter %icon.png,$(icons)))
+		endif
+	endif
+else
+	export APP_ICON := $(TOPDIR)/$(ICON)
+endif
 
 .PHONY: $(BUILD) clean all
 
 #---------------------------------------------------------------------------------
-all: $(BUILD) $(GFXBUILD) $(ROMFS_T3XFILES) $(T3XHFILES)
+all: $(BUILD) $(GFXBUILD) $(ROMFS_T3XFILES) $(T3XHFILES) $(AUDIOBUILD) $(ROMFS_AUDIOFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 
 $(GFXBUILD):
+	@[ -d $@ ] || mkdir -p $@
+
+$(AUDIOBUILD):
 	@[ -d $@ ] || mkdir -p $@
 
 #---------------------------------------------------------------------------------
@@ -128,9 +154,17 @@ $(GFXBUILD)/%.t3x $(BUILD)/%.h : %.t3s | $(BUILD) $(GFXBUILD)
 	@tex3ds -i $< -H $(BUILD)/$*.h -d $(BUILD)/$*.d -o $(GFXBUILD)/$*.t3x
 
 #---------------------------------------------------------------------------------
+# audio/*.wav files are already in a usable format (16-bit PCM) so they just
+# get copied into the romfs as-is, no compilation step needed.
+#---------------------------------------------------------------------------------
+$(AUDIOBUILD)/%.wav : %.wav | $(AUDIOBUILD)
+	@echo $(notdir $<)
+	@cp $< $@
+
+#---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(TARGET).cia $(GFXBUILD)
+	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(TARGET).cia $(ROMFS)
 
 #---------------------------------------------------------------------------------
 else

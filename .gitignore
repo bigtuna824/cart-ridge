@@ -10,3 +10,9 @@ romfs/
 
 # local editor/assistant settings, machine-specific
 .claude/
+
+# raw music source (112MB, uncompressed) -- too large for a 3DS homebrew
+# heap and too large for git. Needs trimming/converting down to something
+# reasonable and placed at audio/music.wav before it can actually ship.
+/deadmau5*.wav
+/deadmau5*.mp3

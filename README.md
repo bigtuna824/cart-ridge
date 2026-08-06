@@ -27,12 +27,20 @@ sitting next to it for every test of the reload mechanic. Everything else
   die**: BASE (any cart reloads), MEDIUM (must swap to a different cart,
   identified by Title ID), FULL (each distinct cart is its own persistent
   magazine). `START` quits from any screen.
-- Wave-survival loop: enemies (placeholder red squares -- no enemy art yet)
-  spawn in escalating waves and walk straight at the player, dealing damage
-  and dying on contact if they're not shot first. `R` fires a forgiving
-  hitscan cone at the nearest enemy roughly in front of you, blocked by
-  walls like everything else. Health hits 0 -> Game Over, showing the wave
-  reached and kill count.
+- Wave-survival loop: enemies (`gfx/enemy.png`, flipped horizontally every
+  ~1s for a cheap walk animation) spawn in escalating waves and walk
+  straight at the player, dealing damage and dying on contact if they're
+  not shot first. Every wave, walls get tinted a fresh random color (fades
+  in with distance, same as the existing depth shading). `R` fires a
+  forgiving hitscan cone at the nearest enemy roughly in front of you,
+  blocked by walls like everything else; kills spawn a brief enlarged
+  muzzle-flash "poof" at the death location. Health hits 0 -> Game Over,
+  showing the wave reached and kill count.
+- Real title screen (`gfx/title.png`) instead of placeholder text.
+- Sound via NDSP: gunshot on fire, distinct cues for pulling
+  (`audio/reload1.wav`) vs. inserting (`audio/reload2.wav`) a cartridge.
+  Background music support is wired up (`audio/music.wav`, looping) but no
+  track is bundled yet -- see below.
 - Circle Pad to move/strafe; look/turn via C-Stick (New3DS) or `Y`/`A`
   (works on any 3DS).
 - Reload logic: pull the Game Card at any time and the gun goes dead
@@ -41,9 +49,15 @@ sitting next to it for every test of the reload mechanic. Everything else
 - Lower screen shows a cartridge-status icon, ammo, gun status, and
   wave/HP/kills.
 
-Only a single tiny 10x10 test map, and enemies are unstyled colored squares
--- this proves the wave-survival loop feels good, but still needs real
-level design and enemy art.
+Only a single tiny 10x10 test map -- the wave-survival loop and its
+presentation are in reasonable shape, but the level itself still needs
+real design.
+
+**Known gap:** no music track is bundled. The source file is an MP3, and
+this dev machine has no MP3 decoder available (no ffmpeg/sox/WSL) to
+convert it to WAV. Once `audio/music.wav` exists (16-bit PCM, any sample
+rate -- `load_wav()` reads the format from the file itself), it'll play
+automatically with zero code changes.
 
 ## Setup (do this once)
 
@@ -81,13 +95,12 @@ level design and enemy art.
 
 1. ~~Raycaster + movement + shooting + cart-slot reload~~ (this POC)
 2. ~~Wall textures instead of flat shaded columns~~
-3. ~~Enemies / targets~~ -- waves, health, hitscan, menu/game-over flow are
-   in; still needs real enemy art (currently flat red squares) and a bigger
-   level than the one tiny 10x10 test map
-4. Sound (gunshot, the actual click of ejecting a cart is a fun cue to add
-   via a custom sound effect)
-5. A custom icon (currently building with libctru's generic default icon via
-   the SMDH auto-build in the Makefile) and a title screen
+3. ~~Enemies / targets~~ -- waves, health, hitscan, menu/game-over flow,
+   real enemy art with a walk animation, and death effects are all in;
+   still needs a bigger level than the one tiny 10x10 test map
+4. ~~Sound~~ -- gunshot + reload cues in via NDSP; background music wired
+   up but not bundled yet (blocked on an MP3->WAV conversion, see above)
+5. ~~A custom icon and a title screen~~
 6. ~~Decide campaign vs. arcade~~ -- arcade/wave-survival, confirmed
 7. Stereoscopic 3D (the physical 3D slider) -- render each eye to a separate
    `C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT/GFX_RIGHT)` target with a small
