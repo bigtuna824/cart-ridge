@@ -1,0 +1,8 @@
+--atlas -f rgba8888 -z auto
+gunidle.png
+gunshooting.png
+gunempty.png
+crosshair.png
+muzzleflash.png
+loadedgunonhud.png
+unloadedgunonhud.png
