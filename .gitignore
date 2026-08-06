@@ -7,3 +7,6 @@ build/
 
 # generated texture atlases (rebuilt from gfx/*.t3s + gfx/*.png)
 romfs/
+
+# local editor/assistant settings, machine-specific
+.claude/
