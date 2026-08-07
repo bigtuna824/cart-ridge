@@ -125,6 +125,35 @@ the roadmap note below for what to watch for first.
    `/3ds/` on your SD card, boot the Homebrew Launcher, launch it, and try
    pulling/reinserting a spare Game Card mid-game.
 
+## Building a CIA (for installing directly, no Homebrew Launcher needed)
+
+For sharing with others who'd rather install it like a normal title (via
+[FBI](https://github.com/Steveice10/FBI) or similar) instead of running it
+through the Homebrew Launcher every time.
+
+1. Make sure `bannertool` and `makerom` are on PATH -- they come from
+   devkitPro's 3dstools package, installed alongside the base 3DS dev
+   tools by the same installer from step 1 above.
+
+2. From the same shell:
+
+   ```bash
+   make cia
+   ```
+
+   This produces `cart-ridge.cia`.
+
+3. Copy it to your SD card and install it with FBI (or another CIA
+   installer). **Requires a console running a CFW that allows self-signed
+   titles (Luma3DS is the standard one)** -- the same requirement as being
+   able to run the Homebrew Launcher at all, so if `cart-ridge.3dsx` already
+   works for you, installing the CIA will too.
+
+The CIA uses a placeholder banner (cropped from the title art, `meta/banner.png`,
+plus a short generated blip for the jingle, `meta/banner.wav`) -- swap those
+files for something nicer whenever you get around to it, no code or Makefile
+changes needed.
+
 ## Roadmap
 
 1. ~~Raycaster + movement + shooting + cart-slot reload~~ (this POC)
@@ -158,6 +187,11 @@ the roadmap note below for what to watch for first.
    `CFGU_GetSystemModel()` (needs `cfguInit()`) returns old 3DS/3DS XL vs.
    New 3DS/XL vs. 2DS family. Needs a distinct gun sprite set per model
    (art work), swapped in at startup based on the detected model.
+10. ~~CIA packaging~~ -- `make cia` produces an installable `cart-ridge.cia`
+    for sharing with people who'd rather install it than run it through the
+    Homebrew Launcher. Uses a placeholder banner/jingle (`meta/banner.png`,
+    `meta/banner.wav`) -- swap those for real ones whenever. Untested on
+    hardware (can't install/verify a CIA from this dev environment).
 
 ## Project layout
 
@@ -165,6 +199,7 @@ the roadmap note below for what to watch for first.
 source/     C source files (main.c is the whole game right now)
 include/    headers (empty for now)
 data/       binary data compiled into the app (currently unused)
+meta/       CIA packaging assets: RSF spec, banner image/audio
 romfs/      assets shipped alongside the app, read at runtime (currently unused)
 Makefile    devkitPro build rules
 ```

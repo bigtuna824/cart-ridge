@@ -116,6 +116,20 @@ export APP_TITLE       := Cart Ridge
 export APP_DESCRIPTION := Reload by swapping game cartridges
 export APP_AUTHOR      := bigtuna824
 
+# --- optional CIA packaging (`make cia`) -----------------------------------
+# Needs bannertool + makerom (devkitPro's 3dstools package) in addition to
+# the base 3DS dev tools -- installable directly (no cart, no Homebrew
+# Launcher needed) via FBI or similar on a console running a CFW that
+# permits self-signed titles (Luma3DS, same as any 3DS already capable of
+# running homebrew at all). Reuses the same .smdh built for the .3dsx below
+# as the CIA's icon -- it's the same file format either way.
+META         := meta
+RSF_FILE     := $(CURDIR)/$(META)/cart-ridge.rsf
+BANNER_IMAGE := $(CURDIR)/$(META)/banner.png
+BANNER_AUDIO := $(CURDIR)/$(META)/banner.wav
+APP_PRODUCT_CODE := CTR-H-CTRG
+APP_UNIQUE_ID    := 0xCA271
+
 ifeq ($(strip $(ICON)),)
 	icons := $(wildcard *.png) $(wildcard $(GRAPHICS)/*.png)
 	ifneq (,$(findstring $(TARGET).png,$(icons)))
@@ -129,7 +143,7 @@ else
 	export APP_ICON := $(TOPDIR)/$(ICON)
 endif
 
-.PHONY: $(BUILD) clean all
+.PHONY: $(BUILD) clean all cia
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(GFXBUILD) $(ROMFS_T3XFILES) $(T3XHFILES) $(AUDIOBUILD) $(ROMFS_AUDIOFILES)
@@ -137,6 +151,23 @@ all: $(BUILD) $(GFXBUILD) $(ROMFS_T3XFILES) $(T3XHFILES) $(AUDIOBUILD) $(ROMFS_A
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
+
+#---------------------------------------------------------------------------------
+# `all` also builds the .elf/.smdh this depends on -- it's phony, so this
+# always re-enters the recursive submake, same as a plain `make` does; that
+# submake's own dependency tracking is what actually skips work when
+# nothing changed.
+#---------------------------------------------------------------------------------
+cia: all $(BUILD)/banner.bnr
+	@echo $(TARGET).cia
+	@makerom -f cia -o $(TARGET).cia -rsf $(RSF_FILE) -target t -exefslogo \
+		-elf $(OUTPUT).elf -icon $(OUTPUT).smdh -banner $(BUILD)/banner.bnr \
+		-DAPP_TITLE="$(APP_TITLE)" -DAPP_PRODUCT_CODE="$(APP_PRODUCT_CODE)" \
+		-DAPP_UNIQUE_ID="$(APP_UNIQUE_ID)" -DAPP_ROMFS="$(CURDIR)/$(ROMFS)"
+
+$(BUILD)/banner.bnr: $(BANNER_IMAGE) $(BANNER_AUDIO) | $(BUILD)
+	@echo banner.bnr
+	@bannertool makebanner -i $(BANNER_IMAGE) -a $(BANNER_AUDIO) -o $(BUILD)/banner.bnr
 
 $(GFXBUILD):
 	@[ -d $@ ] || mkdir -p $@

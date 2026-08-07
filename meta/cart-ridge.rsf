@@ -1,0 +1,156 @@
+BasicInfo:
+  Title                   : $(APP_TITLE)
+  ProductCode             : $(APP_PRODUCT_CODE)
+  Logo                    : Homebrew # unofficial third-party homebrew, not Nintendo-published
+
+RomFs:
+  RootPath                : $(APP_ROMFS)
+
+TitleInfo:
+  Category                : Application
+  UniqueId                : $(APP_UNIQUE_ID)
+
+Option:
+  UseOnSD                 : true  # true if App is to be installed to SD
+  FreeProductCode         : true  # removes validation on ProductCode, since ours isn't a real registered one
+  MediaFootPadding        : false # only relevant for physical cart (CCI) builds
+  EnableCrypt             : false # no retail signing available for homebrew
+  EnableCompress          : true
+
+AccessControlInfo:
+  CoreVersion                   : 2
+  DescVersion                   : 2
+
+  # Minimum required kernel version (4.5.0) -- broad compatibility, no
+  # reason for this project to require anything newer.
+  ReleaseKernelMajor            : "02"
+  ReleaseKernelMinor            : "33"
+
+  UseExtSaveData                : false # no save data
+
+  # Process settings -- standard values for a citro2d/citro3d + NDSP
+  # homebrew app, not tuned to anything specific this game does.
+  MemoryType                    : Application
+  SystemMode                    : 64MB
+  IdealProcessor                : 0
+  AffinityMask                  : 1
+  Priority                       : 16
+  MaxCpu                         : 0xFF
+  HandleTableSize                : 0x200
+  DisableDebug                   : false
+  EnableForceDebug                : false
+  CanWriteSharedPage              : true
+  CanUsePrivilegedPriority        : true
+  CanUseNonAlphabetAndNumber      : true
+  PermitMainFunctionArgument      : true
+  CanShareDeviceMemory            : true
+  RunnableOnSleep                  : false
+  SpecialMemoryArrange             : true
+
+  # No New3DS-exclusive requirement -- this should run the same on Old3DS
+  # and New3DS, so stick to the universally-compatible legacy clock speed.
+  SystemModeExt                    : Legacy
+  CpuSpeed                         : 268MHz
+  EnableL2Cache                    : false
+  CanAccessCore2                    : false
+
+  # DSP memory (audio) + VRAM, needed by NDSP and citro2d/citro3d respectively
+  IORegisterMapping:
+   - 1ff00000-1ff7ffff
+  MemoryMapping:
+   - 1f000000-1f5fffff:r
+
+  # Standard broad syscall set for a citro2d/citro3d homebrew app -- these
+  # are low-level kernel primitives (threading, memory, sync objects),
+  # not app-specific behavior, so this list is the same across most
+  # homebrew regardless of what the app actually does.
+  SystemCallAccess:
+    ArbitrateAddress: 34
+    Backdoor: 123
+    Break: 60
+    CancelTimer: 28
+    ClearEvent: 25
+    ClearTimer: 29
+    CloseHandle: 35
+    ConnectToPort: 45
+    ControlMemory: 1
+    ControlProcessMemory: 112
+    CreateAddressArbiter: 33
+    CreateEvent: 23
+    CreateMemoryBlock: 30
+    CreateMutex: 19
+    CreateSemaphore: 21
+    CreateThread: 8
+    CreateTimer: 26
+    DuplicateHandle: 39
+    ExitProcess: 3
+    ExitThread: 9
+    FlushProcessDataCache: 84
+    GetCurrentProcessorNumber: 17
+    GetHandleInfo: 41
+    GetProcessId: 53
+    GetProcessIdOfThread: 54
+    GetProcessIdealProcessor: 6
+    GetProcessInfo: 43
+    GetResourceLimit: 56
+    GetResourceLimitCurrentValues: 58
+    GetResourceLimitLimitValues: 57
+    GetSystemInfo: 42
+    GetSystemTick: 40
+    GetThreadContext: 59
+    GetThreadId: 55
+    GetThreadIdealProcessor: 15
+    GetThreadInfo: 44
+    GetThreadPriority: 11
+    MapMemoryBlock: 31
+    OutputDebugString: 61
+    QueryMemory: 2
+    ReleaseMutex: 20
+    ReleaseSemaphore: 22
+    SendSyncRequest1: 46
+    SendSyncRequest2: 47
+    SendSyncRequest3: 48
+    SendSyncRequest4: 49
+    SendSyncRequest: 50
+    SetThreadPriority: 12
+    SetTimer: 27
+    SignalEvent: 24
+    SleepThread: 10
+    UnmapMemoryBlock: 32
+    WaitSynchronization1: 36
+    WaitSynchronizationN: 37
+
+  # Trimmed to exactly what this game actually calls at startup (see
+  # source/main.c's init calls): gfx/citro2d+citro3d (gsp), hid, the C-Stick
+  # via irrstInit() (ir:rst), amInit()'s title-list lookup for cart
+  # identification (am:net), NDSP audio (dsp::DSP), local wireless
+  # multiplayer via uds (nwm::UDS, ndm:u), and the filesystem/romfs (fs,
+  # always implicitly available and not declared here). No network,
+  # camera, or mic access requested since this game doesn't use any of it.
+  ServiceAccessControl:
+   - APT:U
+   - am:net
+   - dsp::DSP
+   - fs:USER
+   - gsp::Gpu
+   - hid:USER
+   - ir:rst
+   - ndm:u
+   - nwm::UDS
+
+SystemControlInfo:
+  SaveDataSize: 0KB # no save data
+  RemasterVersion: 0
+  StackSize: 0x40000
+
+  # Module title IDs for each non-core service listed above (fs and APT
+  # are always available to every process and don't need a dependency
+  # entry).
+  Dependency:
+    am: 0x0004013000001502
+    dsp: 0x0004013000001a02
+    gsp: 0x0004013000001c02
+    hid: 0x0004013000001d02
+    ir: 0x0004013000003302
+    ndm: 0x0004013000002b02
+    nwm: 0x0004013000002d02
