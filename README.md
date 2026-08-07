@@ -28,19 +28,48 @@ sitting next to it for every test of the reload mechanic. Everything else
   identified by Title ID), FULL (each distinct cart is its own persistent
   magazine). `START` quits from any screen.
 - Wave-survival loop: enemies (`gfx/enemy.png`, flipped horizontally every
-  ~1s for a cheap walk animation) spawn in escalating waves and walk
-  straight at the player, dealing damage and dying on contact if they're
-  not shot first. Every wave, walls get tinted a fresh random color (fades
-  in with distance, same as the existing depth shading). `R` fires a
-  forgiving hitscan cone at the nearest enemy roughly in front of you,
-  blocked by walls like everything else; kills spawn a brief enlarged
-  muzzle-flash "poof" at the death location. Health hits 0 -> Game Over,
-  showing the wave reached and kill count.
+  ~0.3s for a cheap walk animation, mirrored about its own center rather
+  than an edge) spawn in escalating waves and walk straight at the player,
+  dealing damage and dying on contact if they're not shot first. Every
+  wave, walls get tinted a fresh random color, blended in purely by
+  distance regardless of which way the wall faces. `R` fires a forgiving
+  hitscan cone at the nearest enemy roughly in front of you, blocked by
+  walls like everything else; kills spawn a brief enlarged muzzle-flash
+  "poof" at the death location. Health hits 0 -> Game Over, showing the
+  wave reached and kill count.
+- Scoring: 300 pts per kill, 1000 pts for clearing a wave, and a 500 pt
+  bonus for clearing a wave without taking any damage -- all multiplied by
+  the current wave number, and then by the locked-in immersion level (BASE
+  1x, MEDIUM 2x, FULL 3x), since the stricter levels are harder to play
+  under.
 - Real title screen (`gfx/title.png`) instead of placeholder text.
 - Sound via NDSP: gunshot on fire, distinct cues for pulling
-  (`audio/reload1.wav`) vs. inserting (`audio/reload2.wav`) a cartridge.
-  Background music support is wired up (`audio/music.wav`, looping) but no
-  track is bundled yet -- see below.
+  (`audio/reload1.wav`) vs. inserting (`audio/reload2.wav`) a cartridge,
+  and a looping background music track (`audio/music.wav`).
+- Local multiplayer: 4-player co-op wave-survival over local wireless
+  (libctru's `uds` service) is implemented but **shelved for now** --
+  only one physical 3DS is currently available to test with, so it's
+  unverified and not exercised in normal play until a second console is
+  on hand. One console hosts (creates the network and runs the full
+  simulation -- waves, enemy AI, hit resolution, health), up to 3 more
+  join as clients (send input, render a host-broadcast snapshot of the
+  world). Each player's cart-reload state is entirely local and never
+  networked -- your ammo is your own physical cartridge. Other players
+  currently render as flat colored placeholder rectangles; no avatar art
+  exists yet.
+- Stereoscopic 3D: the top screen renders separately per eye. Each wall
+  column and sprite gets a small screen-space horizontal shift based on
+  its own distance (near = shifts toward the center/"pops out", far =
+  shifts outward/recedes), zero right at a fixed convergence distance and
+  hard-clamped to a few pixels max so nothing -- not even a wall right
+  against the camera -- can ever demand more disparity than a comfortable
+  amount. Scaled by the physical 3D slider (`osGet3DSliderState()`), so
+  it's flat at slider-zero. Menus and the HUD render the same flat
+  content to both eyes; only the actual gameplay view gets real
+  parallax. (An earlier version shifted the raycast camera position
+  directly instead -- that produced unbounded, reversed disparity and
+  was genuinely nauseating to test; this pixel-shift-with-convergence
+  approach replaced it.)
 - Circle Pad to move/strafe; look/turn via C-Stick (New3DS) or `Y`/`A`
   (works on any 3DS).
 - Reload logic: pull the Game Card at any time and the gun goes dead
@@ -53,11 +82,10 @@ Only a single tiny 10x10 test map -- the wave-survival loop and its
 presentation are in reasonable shape, but the level itself still needs
 real design.
 
-**Known gap:** no music track is bundled. The source file is an MP3, and
-this dev machine has no MP3 decoder available (no ffmpeg/sox/WSL) to
-convert it to WAV. Once `audio/music.wav` exists (16-bit PCM, any sample
-rate -- `load_wav()` reads the format from the file itself), it'll play
-automatically with zero code changes.
+**Known gap:** multiplayer is implemented and self-reviewed but has never
+been run -- it needs two or more physical 3DS consoles in local wireless
+range to test at all, which isn't possible from this dev environment. See
+the roadmap note below for what to watch for first.
 
 ## Setup (do this once)
 
@@ -98,19 +126,28 @@ automatically with zero code changes.
 3. ~~Enemies / targets~~ -- waves, health, hitscan, menu/game-over flow,
    real enemy art with a walk animation, and death effects are all in;
    still needs a bigger level than the one tiny 10x10 test map
-4. ~~Sound~~ -- gunshot + reload cues in via NDSP; background music wired
-   up but not bundled yet (blocked on an MP3->WAV conversion, see above)
+4. ~~Sound~~ -- gunshot, reload cues, and looping background music, all via
+   NDSP
 5. ~~A custom icon and a title screen~~
 6. ~~Decide campaign vs. arcade~~ -- arcade/wave-survival, confirmed
-7. Stereoscopic 3D (the physical 3D slider) -- render each eye to a separate
-   `C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT/GFX_RIGHT)` target with a small
-   camera offset driven by `osGet3DSliderState()`, and call `gfxSet3D(true)`.
-   No new art needed, just a second render pass per frame.
-8. Local multiplayer -- likely built on libctru's `uds` service (local
-   wireless, no internet needed, same mechanism as Download Play). Haven't
-   scoped this out yet; will need real research once we get here, since it
-   touches session hosting/joining and probably changes how waves/enemies
-   are shared between players.
+7. Local multiplayer -- 4-player host-authoritative co-op over `uds` local
+   wireless is written and self-reviewed but **shelved for now**: it needs
+   2+ physical consoles to test, and only one is currently available.
+   Revisit once a second console is on hand. Still needs real avatar art
+   (other players are flat colored rectangles right now) and mid-game
+   joining isn't supported (lobby-only, pre-start).
+8. ~~Stereoscopic 3D~~ -- each eye renders to its own
+   `C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT/GFX_RIGHT)`. Disparity is a
+   per-object screen-space pixel shift derived from that object's own
+   distance, zero at a fixed convergence distance and clamped to a small
+   max so nothing can ever demand excessive separation, scaled by
+   `osGet3DSliderState()`. First version moved the raycast camera position
+   directly and had the eyes swapped -- confirmed nauseating on hardware
+   (reversed/unbounded disparity), replaced with this clamped,
+   convergence-based approach. Still untested on hardware; the constants
+   (`STEREO_CONVERGE_DIST`, `STEREO_MAX_SHIFT_PX`, `STEREO_STRENGTH_PX` in
+   `source/main.c`) are a conservative starting guess and may need
+   tuning once you can try it.
 9. Gun skin changes based on which 3DS model the player is running on --
    `CFGU_GetSystemModel()` (needs `cfguInit()`) returns old 3DS/3DS XL vs.
    New 3DS/XL vs. 2DS family. Needs a distinct gun sprite set per model
