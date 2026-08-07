@@ -19,6 +19,33 @@
 #define SCREEN_H       240
 #define MAP_SIZE       10
 #define FOV            1.2f   // radians, ~69 degrees
+// Stereo 3D disparity is applied as a small per-object screen-space pixel
+// shift (NOT a raycast camera move -- shifting the camera position caused
+// unbounded, sign-reversed disparity for walls close to the player, which
+// is exactly what makes a 3D effect nauseating instead of just subtle).
+// STEREO_CONVERGE_DIST is the depth (in tiles) that lines up with zero
+// disparity -- nearer objects pop out, farther objects recede. Everything
+// closer than ~0.3 tiles is treated as if it were 0.3 tiles away for this
+// calculation, and the final shift is hard-clamped to
+// STEREO_MAX_SHIFT_PX regardless of distance, so nothing can ever demand
+// more disparity than that even for a wall right against the camera.
+#define STEREO_CONVERGE_DIST 2.5f
+#define STEREO_MAX_SHIFT_PX  6.0f
+// Wall strips are rendered independently (RENDER_STRIDE pixels wide) and
+// each now gets its own depth-based shift, so where depth changes from one
+// strip to the next -- a receding wall, a corner -- adjacent strips can
+// end up shifted by different amounts and leave a thin gap between them.
+// Drawing each strip a bit wider than it needs to be (and centered on its
+// shifted position) makes strips overlap slightly instead, hiding that gap.
+// Keep this small: it only needs to cover the sub-pixel-to-a-couple-pixel
+// shift difference between adjacent strips on an ordinary continuous
+// surface. At a genuine depth discontinuity (an actual corner) the shift
+// difference is much bigger, and overlap can't hide that without smearing
+// one strip's texture past the corner -- which reads as seeing a sliver of
+// the other eye's view, since that's exactly where the two eyes differ
+// most. A wider value trades more hidden gaps for worse corner smearing.
+#define STEREO_STRIP_OVERLAP_PX 1.5f
+#define STEREO_STRENGTH_PX   35.0f
 #define PI             3.14159265359f
 #define MOVE_SPEED     2.2f   // map tiles per second
 #define TURN_SPEED     2.6f   // radians per second
@@ -32,6 +59,59 @@
 #define ENEMY_MELEE_RANGE   0.5f
 #define ENEMY_SPAWN_MIN_DIST 3.0f  // don't spawn closer than this to the player
 #define ENEMY_AIM_TOLERANCE 0.15f  // radians -- forgiving hitscan cone
+#define ENEMY_FLIP_PERIOD   0.3f   // seconds per flip half-cycle (walk animation)
+
+#define MAX_DEATH_EFFECTS     8
+#define DEATH_EFFECT_DURATION 0.25f
+
+// NDSP channels -- one dedicated channel per sound so overlapping triggers
+// (e.g. firing again before the last shot's sound finished) just restart
+// that channel instead of needing a general-purpose mixer/voice pool.
+#define CH_MUSIC   0
+#define CH_GUNSHOT 1
+#define CH_RELOAD1 2
+#define CH_RELOAD2 3
+
+// --- local multiplayer (UDS) -----------------------------------------
+// Call patterns verified against devkitPro's official example
+// (3ds-examples/network/uds/source/uds.c) since this service was
+// completely new territory for the project and hardware-testable only
+// with 2+ physical consoles running at once.
+#define MP_WLANCOMMID    0x43415254u  // arbitrary app-unique ID ("CART")
+#define MP_PASSPHRASE    "cart ridge multiplayer v1"
+#define MP_DATA_CHANNEL  1
+#define MP_MAX_PLAYERS   4
+#define MP_TICK_INTERVAL 0.05f  // 20Hz network send rate, decoupled from render rate
+
+typedef enum { MP_OFF, MP_HOST, MP_CLIENT } MpRole;
+enum { PKT_CLIENT_INPUT = 1, PKT_HOST_STATE = 2, PKT_HOST_START = 3 };
+
+// Sent by each client to the host, at MP_TICK_INTERVAL.
+typedef struct {
+	u8 type; // PKT_CLIENT_INPUT
+	float px, py, pa;
+	u8 firing; // edge-triggered: true for exactly one send per shot fired
+} MpInputPacket;
+
+// Sent by the host to everyone, at MP_TICK_INTERVAL -- the full
+// authoritative world snapshot. Struct is memcpy'd raw over the wire,
+// which is safe here since every player runs the same binary (same
+// compiler, same ABI, same endianness).
+typedef struct {
+	u8 type; // PKT_HOST_STATE
+	u8 wave;
+	u8 gameOver;
+	u8 finalWave;
+	u32 waveTintColor;
+	struct { float x, y, pa; u8 health; u8 alive; u8 connected; } players[MP_MAX_PLAYERS];
+	struct { float x, y; u8 alive; } enemies[MAX_ENEMIES];
+} MpStatePacket;
+
+typedef struct { u8 type; } MpStartPacket; // PKT_HOST_START
+
+// Other players as seen for rendering -- populated from received network
+// data, not simulated locally (that's the host's job).
+typedef struct { float x, y; bool alive; bool connected; } RemotePlayer;
 
 // 1 = wall, 0 = open floor. Kept tiny on purpose -- this is just enough
 // to prove out the raycaster and the reload mechanic, not a real level.
@@ -55,7 +135,10 @@ typedef enum {
 	                   // system to actually mount it before reading its ID
 } GunState;
 
-// Immersion levels, chosen at the menu and locked for the run:
+// Immersion levels, chosen at the menu and locked for the run. Each
+// player's own immersion level and reload state stays fully local to
+// their own console (and their own cart slot) even in multiplayer --
+// only never transmitted.
 //   BASE   -- one cartridge. Pull it and put any cart back in to reload.
 //   MEDIUM -- two+ carts. Re-inserting the SAME cart you pulled does nothing;
 //             you must swap in a genuinely different one to reload.
@@ -66,9 +149,12 @@ typedef enum {
 //             copies of the identical game are indistinguishable).
 typedef enum { IMM_BASE, IMM_MEDIUM, IMM_FULL, IMM_COUNT } Immersion;
 
-typedef enum { SCREEN_MENU, SCREEN_PLAYING, SCREEN_GAMEOVER } GameScreen;
+typedef enum {
+	SCREEN_MENU, SCREEN_MP_MENU, SCREEN_MP_LOBBY, SCREEN_PLAYING, SCREEN_GAMEOVER
+} GameScreen;
 
 typedef struct { float x, y; bool alive; } Enemy;
+typedef struct { float x, y; float timer; bool active; } DeathEffect;
 
 static const char* immersion_name(Immersion imm) {
 	switch (imm) {
@@ -79,9 +165,32 @@ static const char* immersion_name(Immersion imm) {
 	}
 }
 
+// Stricter immersion levels are harder to play under (a real cart swap vs.
+// just any cart reloading), so they're worth more: BASE 1x, MEDIUM 2x, FULL
+// 3x. Relies on the enum's declaration order (IMM_BASE=0, IMM_MEDIUM=1,
+// IMM_FULL=2) matching that ordering.
+static int immersion_score_multiplier(Immersion imm) {
+	return (int)imm + 1;
+}
+
 typedef struct { u64 titleId; int ammo; } CartMag;
 static CartMag mags[MAX_TRACKED_CARTS];
 static int magCount = 0;
+
+// --- audio -----------------------------------------------------------
+// A WAV's raw PCM samples, loaded into linear memory (required for the DSP
+// to read them directly) plus the format info needed to configure an NDSP
+// channel to play them back correctly.
+typedef struct {
+	void* data;
+	u32   nsamples;   // frames, not bytes
+	u16   channels;
+	u32   sampleRate;
+} Sound;
+
+static Sound sounds[4];          // indexed by CH_* constants
+static ndspWaveBuf waveBufs[4];  // must outlive playback -- can't be a local
+static bool audioReady = false;
 
 // Finds the magazine for a given cartridge (by Title ID), creating a
 // freshly-full one the first time a cartridge is seen. If more than
@@ -113,6 +222,128 @@ static u64 read_cart_title_id(Result* outResult, u32* outTitlesRead) {
 	if (outTitlesRead) *outTitlesRead = titlesRead;
 	if (R_FAILED(r) || titlesRead == 0) return 0;
 	return titleId;
+}
+
+// Parses a WAV file's fmt/data chunks (tolerating whatever chunks come
+// before "data", which is all a typical encoder/converter needs) and
+// copies the raw PCM into a freshly linearAlloc'd buffer ready for NDSP.
+// 3DS homebrew apps run with a heap in the tens-of-MB range, nowhere near
+// enough for, say, an uncompressed full-length music track (a several
+// hundred MB WAV would blow the budget outright). Rather than let a
+// too-large file take its chances with malloc, reject it up front so
+// loading fails predictably instead of however OOM happens to behave.
+// 16MB is roughly 80s of 16-bit stereo 48kHz audio -- plenty for a
+// looping BGM clip.
+#define MAX_WAV_FILE_SIZE (16 * 1024 * 1024)
+
+static bool load_wav(const char* path, Sound* out) {
+	FILE* f = fopen(path, "rb");
+	if (!f) return false;
+	fseek(f, 0, SEEK_END);
+	long fileSize = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (fileSize <= 12 || fileSize > MAX_WAV_FILE_SIZE) { fclose(f); return false; }
+
+	u8* raw = (u8*)malloc(fileSize);
+	if (!raw) { fclose(f); return false; }
+	size_t readBytes = fread(raw, 1, fileSize, f);
+	fclose(f);
+	if ((long)readBytes != fileSize) { free(raw); return false; }
+
+	u16 fmtChannels = 2;
+	u32 fmtRate = 48000;
+	u16 fmtBits = 16;
+	long dataOffset = -1;
+	u32 dataSize = 0;
+
+	for (long i = 12; i + 8 <= fileSize; ) {
+		u32 chunkSize = raw[i+4] | (raw[i+5] << 8) | (raw[i+6] << 16) | ((u32)raw[i+7] << 24);
+		if (memcmp(raw + i, "fmt ", 4) == 0 && i + 8 + 16 <= fileSize) {
+			fmtChannels = raw[i+8+2] | (raw[i+8+3] << 8);
+			fmtRate = raw[i+8+4] | (raw[i+8+5] << 8) | (raw[i+8+6] << 16) | ((u32)raw[i+8+7] << 24);
+			fmtBits = raw[i+8+14] | (raw[i+8+15] << 8);
+		} else if (memcmp(raw + i, "data", 4) == 0) {
+			dataSize = chunkSize;
+			dataOffset = i + 8;
+			break;
+		}
+		i += 8 + chunkSize + (chunkSize & 1); // chunks are word-aligned
+	}
+	if (dataOffset < 0 || fmtChannels == 0 || fmtBits == 0) { free(raw); return false; }
+	if (dataOffset + (long)dataSize > fileSize) dataSize = (u32)(fileSize - dataOffset);
+
+	out->data = linearAlloc(dataSize);
+	if (!out->data) { free(raw); return false; }
+	memcpy(out->data, raw + dataOffset, dataSize);
+	free(raw);
+	DSP_FlushDataCache(out->data, dataSize);
+
+	out->channels = fmtChannels;
+	out->sampleRate = fmtRate;
+	out->nsamples = dataSize / ((fmtBits / 8) * fmtChannels);
+	return true;
+}
+
+static void setup_channel(int ch, const Sound* s) {
+	if (!audioReady || !s->data) return;
+	ndspChnReset(ch);
+	ndspChnSetInterp(ch, NDSP_INTERP_LINEAR);
+	ndspChnSetRate(ch, (float)s->sampleRate);
+	ndspChnSetFormat(ch, s->channels == 2 ? NDSP_FORMAT_STEREO_PCM16 : NDSP_FORMAT_MONO_PCM16);
+}
+
+static void play_sound(int ch, const Sound* s, bool loop) {
+	if (!audioReady || !s->data) return;
+	ndspChnWaveBufClear(ch);
+	memset(&waveBufs[ch], 0, sizeof(ndspWaveBuf));
+	waveBufs[ch].data_vaddr = s->data;
+	waveBufs[ch].nsamples = s->nsamples;
+	waveBufs[ch].looping = loop;
+	ndspChnWaveBufAdd(ch, &waveBufs[ch]);
+}
+
+static u32 random_wave_color(void) {
+	return C2D_Color32((u8)(rand() % 256), (u8)(rand() % 256), (u8)(rand() % 256), 255);
+}
+
+// --- multiplayer networking -------------------------------------------
+
+static bool mp_host_create(udsBindContext* ctx) {
+	udsNetworkStruct network;
+	udsGenerateDefaultNetworkStruct(&network, MP_WLANCOMMID, 0, MP_MAX_PLAYERS);
+	Result r = udsCreateNetwork(&network, MP_PASSPHRASE, sizeof(MP_PASSPHRASE), ctx,
+		MP_DATA_CHANNEL, UDS_DEFAULT_RECVBUFSIZE);
+	return R_SUCCEEDED(r);
+}
+
+// One scan attempt, connecting to the first matching network found. This
+// blocks for real time (a beacon scan takes a moment) -- fine behind a
+// deliberate "Join" button press, not something to call mid-gameplay.
+static bool mp_client_scan_and_connect(udsBindContext* ctx) {
+	size_t tmpbufSize = 0x4000;
+	void* tmpbuf = malloc(tmpbufSize);
+	if (!tmpbuf) return false;
+	memset(tmpbuf, 0, tmpbufSize);
+
+	udsNetworkScanInfo* networks = NULL;
+	size_t totalNetworks = 0;
+	Result r = udsScanBeacons(tmpbuf, tmpbufSize, &networks, &totalNetworks, MP_WLANCOMMID, 0, NULL, false);
+	free(tmpbuf);
+	if (R_FAILED(r) || totalNetworks == 0) return false;
+
+	r = udsConnectNetwork(&networks[0].network, MP_PASSPHRASE, sizeof(MP_PASSPHRASE), ctx,
+		UDS_BROADCAST_NETWORKNODEID, UDSCONTYPE_Client, MP_DATA_CHANNEL, UDS_DEFAULT_RECVBUFSIZE);
+	free(networks);
+	return R_SUCCEEDED(r);
+}
+
+static u32 player_color(int idx) {
+	switch (idx) {
+		case 0:  return C2D_Color32(220, 120, 0, 255);   // host -- orange
+		case 1:  return C2D_Color32(60, 130, 240, 255);  // blue
+		case 2:  return C2D_Color32(60, 210, 104, 255);  // green
+		default: return C2D_Color32(224, 210, 60, 255);  // yellow
+	}
 }
 
 static int wall_is_solid(int x, int y) {
@@ -170,13 +401,75 @@ static int count_alive_enemies(Enemy* enemies) {
 	return n;
 }
 
+static void spawn_death_effect(DeathEffect* effects, float x, float y) {
+	for (int i = 0; i < MAX_DEATH_EFFECTS; i++) {
+		if (!effects[i].active) {
+			effects[i].x = x;
+			effects[i].y = y;
+			effects[i].timer = DEATH_EFFECT_DURATION;
+			effects[i].active = true;
+			return;
+		}
+	}
+	// all slots busy -- purely cosmetic, fine to just drop it
+}
+
+// Finds the closest alive enemy within a forgiving aim cone of (fx,fy,fa)
+// that has line of sight, kills it, and spawns a death effect. Shared by
+// the local player's own shot and (in multiplayer) the host resolving a
+// remote client's reported shot.
+#define SCORE_PER_KILL       300
+#define SCORE_PER_WAVE_CLEAR 1000
+#define SCORE_NO_DAMAGE_WAVE 500
+
+static void try_hitscan(Enemy* enemies, DeathEffect* effects, float fx, float fy, float fa,
+		int wave, int scoreMult, int* kills, int* score) {
+	int bestIdx = -1;
+	float bestDist = MAX_DEPTH;
+	for (int i = 0; i < MAX_ENEMIES; i++) {
+		if (!enemies[i].alive) continue;
+		float dx = enemies[i].x - fx, dy = enemies[i].y - fy;
+		float dist = sqrtf(dx * dx + dy * dy);
+		if (dist >= bestDist) continue;
+		float relAngle = normalize_angle(atan2f(dy, dx) - fa);
+		if (fabsf(relAngle) > ENEMY_AIM_TOLERANCE) continue;
+		if (!has_line_of_sight(fx, fy, enemies[i].x, enemies[i].y)) continue;
+		bestDist = dist;
+		bestIdx = i;
+	}
+	if (bestIdx >= 0) {
+		enemies[bestIdx].alive = false;
+		if (kills) (*kills)++;
+		if (score) *score += SCORE_PER_KILL * wave * scoreMult;
+		spawn_death_effect(effects, enemies[bestIdx].x, enemies[bestIdx].y);
+	}
+}
+
+// Horizontal screen-space disparity for a point at the given distance.
+// Positive means "shift toward this eye's side of center for a near
+// object" -- the caller multiplies by +1 for the left eye and -1 for the
+// right eye (or vice versa consistently) to get actual per-eye shifts.
+// Zero at STEREO_CONVERGE_DIST, grows for nearer/farther points, always
+// clamped so a single object can never demand more than
+// STEREO_MAX_SHIFT_PX of separation.
+static float stereo_shift_px(float dist, float slider3d) {
+	if (slider3d <= 0.0f) return 0.0f;
+	float d = dist < 0.3f ? 0.3f : dist;
+	float depthTerm = (1.0f / d) - (1.0f / STEREO_CONVERGE_DIST);
+	float shiftPx = STEREO_STRENGTH_PX * depthTerm * slider3d;
+	if (shiftPx > STEREO_MAX_SHIFT_PX) shiftPx = STEREO_MAX_SHIFT_PX;
+	if (shiftPx < -STEREO_MAX_SHIFT_PX) shiftPx = -STEREO_MAX_SHIFT_PX;
+	return shiftPx;
+}
+
 // width of each rendered strip in pixels -- one C2D_DrawImageAt call is
 // issued per strip, and citro3d's command buffer can't take 400 individual
 // draw calls in one frame (that's what caused earlier crashes), so we
 // cast fewer, wider rays instead of one per screen column.
 #define RENDER_STRIDE 4
 
-static void draw_frame(float px, float py, float pa, C2D_Image wallImg) {
+static void draw_frame(float px, float py, float pa, C2D_Image wallImg, u32 waveTintColor,
+		float eyeSign, float slider3d) {
 	for (int col = 0; col < SCREEN_W; col += RENDER_STRIDE) {
 		float rayAngle = (pa - FOV / 2.0f) + ((float)col / SCREEN_W) * FOV;
 		float rayDirX = cosf(rayAngle);
@@ -234,24 +527,47 @@ static void draw_frame(float px, float py, float pa, C2D_Image wallImg) {
 		strip.right = wallHit + (1.0f / (float)wallImg.subtex->width);
 		C2D_Image colImg = { wallImg.tex, &strip };
 
-		// distance + side shading, done as a tint-toward-black so the
-		// texture detail survives instead of flattening to a solid color
+		// distance + side shading, done as a tint-toward-a-color so the
+		// texture detail survives instead of flattening to a solid color.
+		// The tint target is this wave's random color instead of plain
+		// black, so far walls fade toward a wave-specific mood color
+		// while near walls still show mostly-true wall texture. Blend
+		// amount depends only on distance (with a floor so the tint is
+		// visible even up close) -- it used to also jump for side==1
+		// walls, which made N/S walls show the tint strongly while E/W
+		// walls barely showed it at all ("only certain directions"). The
+		// side-based lighting cue is now a darker TARGET color instead,
+		// which doesn't suppress tint visibility.
 		float darken = dist / MAX_DEPTH;
 		if (darken > 0.85f) darken = 0.85f;
-		if (side == 1) darken += (1.0f - darken) * 0.3f;
+		if (darken < 0.3f) darken = 0.3f;
+		u32 tintTarget = waveTintColor;
+		if (side == 1) {
+			u8 r = (u8)((waveTintColor & 0xFF) * 0.7f);
+			u8 g = (u8)(((waveTintColor >> 8) & 0xFF) * 0.7f);
+			u8 b = (u8)(((waveTintColor >> 16) & 0xFF) * 0.7f);
+			tintTarget = C2D_Color32(r, g, b, 255);
+		}
 		C2D_ImageTint tint;
-		C2D_PlainImageTint(&tint, C2D_Color32(0, 0, 0, 255), darken);
+		C2D_PlainImageTint(&tint, tintTarget, darken);
 
-		C2D_DrawImageAt(colImg, (float)col, (float)drawStart, 0.5f, &tint,
-			(float)RENDER_STRIDE, (float)(drawEnd - drawStart) / (float)strip.height);
+		float stereoX = (float)col + eyeSign * stereo_shift_px(dist, slider3d);
+		float stripWidth = (float)RENDER_STRIDE + STEREO_STRIP_OVERLAP_PX;
+		C2D_DrawImageAt(colImg, stereoX - STEREO_STRIP_OVERLAP_PX / 2.0f, (float)drawStart, 0.5f, &tint,
+			stripWidth, (float)(drawEnd - drawStart) / (float)strip.height);
 	}
 }
 
-// Placeholder enemy rendering (flat red squares) -- no enemy art exists
-// yet. Angle-to-screen-X uses the same linear mapping draw_frame() uses
-// for wall columns (not a tangent-correct projection), so enemies line up
-// with the walls instead of drifting relative to them.
-static void draw_enemies(Enemy* enemies, float px, float py, float pa) {
+// Angle-to-screen-X uses the same linear mapping draw_frame() uses for
+// wall columns (not a tangent-correct projection), so billboarded sprites
+// line up with the walls instead of drifting relative to them.
+static float billboard_screen_x(float relAngle) {
+	return SCREEN_W * (relAngle + FOV / 2.0f) / FOV;
+}
+
+static void draw_enemies(Enemy* enemies, float px, float py, float pa, C2D_Image img, bool flipped,
+		float eyeSign, float slider3d) {
+	float aspect = (float)img.subtex->width / (float)img.subtex->height;
 	for (int i = 0; i < MAX_ENEMIES; i++) {
 		if (!enemies[i].alive) continue;
 
@@ -263,35 +579,171 @@ static void draw_enemies(Enemy* enemies, float px, float py, float pa) {
 		if (fabsf(relAngle) > FOV / 2.0f + 0.3f) continue; // cheap off-screen cull
 		if (!has_line_of_sight(px, py, enemies[i].x, enemies[i].y)) continue;
 
-		float screenX = SCREEN_W * (relAngle + FOV / 2.0f) / FOV;
-		float size = (SCREEN_H / dist) * 0.5f;
+		float screenX = billboard_screen_x(relAngle);
+		float height = (SCREEN_H / dist) * 0.5f;
+		float scale = height / (float)img.subtex->height;
+		float halfWidth = (height * aspect) / 2.0f;
 
 		float shade = 1.0f - dist / MAX_DEPTH;
 		if (shade < 0.2f) shade = 0.2f;
-		u32 color = C2D_Color32((u8)(220 * shade), (u8)(40 * shade), (u8)(40 * shade), 255);
+		C2D_ImageTint tint;
+		C2D_PlainImageTint(&tint, C2D_Color32(0, 0, 0, 255), 1.0f - shade);
 
-		C2D_DrawRectSolid(screenX - size / 2.0f, SCREEN_H / 2.0f - size / 2.0f, 0.52f,
-			size, size, color);
+		// citro2d's flip (negative scaleX) is a pure UV swap inside a quad
+		// whose geometry is always sized from fabs(scale) -- the quad's
+		// screen position never changes based on sign. So the draw
+		// position is the same either way; only the scale sign flips.
+		// This also means it flips around the sprite's own center, not
+		// an edge, which is what we want.
+		float drawX = screenX - halfWidth + eyeSign * stereo_shift_px(dist, slider3d);
+		float drawScaleX = flipped ? -scale : scale;
+		C2D_DrawImageAt(img, drawX, SCREEN_H / 2.0f - height / 2.0f, 0.52f, &tint,
+			drawScaleX, scale);
 	}
+}
+
+static void draw_death_effects(DeathEffect* effects, float px, float py, float pa, C2D_Image img,
+		float eyeSign, float slider3d) {
+	for (int i = 0; i < MAX_DEATH_EFFECTS; i++) {
+		if (!effects[i].active) continue;
+
+		float dx = effects[i].x - px, dy = effects[i].y - py;
+		float dist = sqrtf(dx * dx + dy * dy);
+		if (dist >= 0.1f && dist <= MAX_DEPTH) {
+			float relAngle = normalize_angle(atan2f(dy, dx) - pa);
+			if (fabsf(relAngle) <= FOV / 2.0f + 0.3f && has_line_of_sight(px, py, effects[i].x, effects[i].y)) {
+				float screenX = billboard_screen_x(relAngle);
+				float height = (SCREEN_H / dist) * 1.1f; // bigger than an enemy -- a death poof, not a normal sprite
+				float scale = height / (float)img.subtex->height;
+				float drawX = screenX - (img.subtex->width * scale) / 2.0f + eyeSign * stereo_shift_px(dist, slider3d);
+				C2D_DrawImageAt(img, drawX, SCREEN_H / 2.0f - height / 2.0f, 0.53f, NULL, scale, scale);
+			}
+		}
+	}
+}
+
+// Placeholder rendering for other players (no avatar art yet) -- flat
+// colored rectangles, one color per player slot, billboarded the same way
+// as enemies. myIdx is skipped since a player never renders themselves.
+static void draw_remote_players(RemotePlayer* players, int myIdx, float px, float py, float pa,
+		float eyeSign, float slider3d) {
+	for (int i = 0; i < MP_MAX_PLAYERS; i++) {
+		if (i == myIdx || !players[i].connected || !players[i].alive) continue;
+
+		float dx = players[i].x - px, dy = players[i].y - py;
+		float dist = sqrtf(dx * dx + dy * dy);
+		if (dist < 0.2f || dist > MAX_DEPTH) continue;
+
+		float relAngle = normalize_angle(atan2f(dy, dx) - pa);
+		if (fabsf(relAngle) > FOV / 2.0f + 0.3f) continue;
+		if (!has_line_of_sight(px, py, players[i].x, players[i].y)) continue;
+
+		float screenX = billboard_screen_x(relAngle);
+		float height = (SCREEN_H / dist) * 0.6f; // a bit taller than enemies -- distinct silhouette
+		float width = height * 0.6f;
+
+		float shade = 1.0f - dist / MAX_DEPTH;
+		if (shade < 0.3f) shade = 0.3f;
+		u32 base = player_color(i);
+		u8 r = (u8)((base & 0xFF) * shade);
+		u8 g = (u8)(((base >> 8) & 0xFF) * shade);
+		u8 b = (u8)(((base >> 16) & 0xFF) * shade);
+
+		float drawX = screenX - width / 2.0f + eyeSign * stereo_shift_px(dist, slider3d);
+		C2D_DrawRectSolid(drawX, SCREEN_H / 2.0f - height / 2.0f, 0.515f,
+			width, height, C2D_Color32(r, g, b, 255));
+	}
+}
+
+// Bottom-screen minimap -- lives in the unused space to the right of the
+// existing HUD text (which stops around x=180). This is a full radar, not
+// a line-of-sight-limited map: enemies (and other players) always show up
+// at their real position regardless of walls between them and you, since
+// the point is to always know where the threats are.
+#define MINIMAP_PX_PER_TILE 9.0f
+#define MINIMAP_ORIGIN_X    215.0f
+#define MINIMAP_ORIGIN_Y    10.0f
+
+static void draw_minimap(float px, float py, float pa, Enemy* enemies, MpRole mpRole,
+		RemotePlayer* remotePlayers, int myIdx) {
+	float ox = MINIMAP_ORIGIN_X, oy = MINIMAP_ORIGIN_Y;
+	float mapPx = MAP_SIZE * MINIMAP_PX_PER_TILE;
+
+	C2D_DrawRectSolid(ox - 2.0f, oy - 2.0f, 0.5f, mapPx + 4.0f, mapPx + 4.0f, C2D_Color32(0, 0, 0, 220));
+
+	for (int y = 0; y < MAP_SIZE; y++) {
+		for (int x = 0; x < MAP_SIZE; x++) {
+			u32 color = wall_is_solid(x, y) ? C2D_Color32(100, 100, 120, 255) : C2D_Color32(30, 30, 42, 255);
+			C2D_DrawRectSolid(ox + x * MINIMAP_PX_PER_TILE, oy + y * MINIMAP_PX_PER_TILE, 0.5f,
+				MINIMAP_PX_PER_TILE, MINIMAP_PX_PER_TILE, color);
+		}
+	}
+
+	for (int i = 0; i < MAX_ENEMIES; i++) {
+		if (!enemies[i].alive) continue;
+		float ex = ox + enemies[i].x * MINIMAP_PX_PER_TILE;
+		float ey = oy + enemies[i].y * MINIMAP_PX_PER_TILE;
+		C2D_DrawRectSolid(ex - 2.0f, ey - 2.0f, 0.52f, 4.0f, 4.0f, C2D_Color32(255, 60, 60, 255));
+	}
+
+	if (mpRole != MP_OFF) {
+		for (int i = 0; i < MP_MAX_PLAYERS; i++) {
+			if (i == myIdx || !remotePlayers[i].connected || !remotePlayers[i].alive) continue;
+			float rx = ox + remotePlayers[i].x * MINIMAP_PX_PER_TILE;
+			float ry = oy + remotePlayers[i].y * MINIMAP_PX_PER_TILE;
+			C2D_DrawRectSolid(rx - 2.0f, ry - 2.0f, 0.52f, 4.0f, 4.0f, player_color(i));
+		}
+	}
+
+	float pxm = ox + px * MINIMAP_PX_PER_TILE;
+	float pym = oy + py * MINIMAP_PX_PER_TILE;
+	u32 playerColor = C2D_Color32(120, 255, 120, 255);
+	float facingX = pxm + cosf(pa) * 10.0f;
+	float facingY = pym + sinf(pa) * 10.0f;
+	C2D_DrawLine(pxm, pym, playerColor, facingX, facingY, playerColor, 2.0f, 0.53f);
+	C2D_DrawRectSolid(pxm - 2.0f, pym - 2.0f, 0.54f, 4.0f, 4.0f, playerColor);
 }
 
 int main(int argc, char **argv) {
 	gfxInitDefault();
 	// hid and fs are already brought up by libctru's default __appInit, so
 	// hidScanInput() and FSUSER_* calls work with no extra setup here. The
-	// C-stick and title lookups are separate services that do need their
-	// own init.
+	// C-stick, title lookups, audio, and local multiplayer are separate
+	// services that do need their own init.
 	irrstInit();
 	amInit();
 	romfsInit();
+	audioReady = R_SUCCEEDED(ndspInit());
+	bool mpAvailable = R_SUCCEEDED(udsInit(0x3000, NULL));
 	srand((unsigned int)svcGetSystemTick());
+
+	if (audioReady) {
+		// music is optional -- silently skipped if audio/music.wav doesn't
+		// exist yet, everything else still works
+		load_wav("romfs:/audio/music.wav", &sounds[CH_MUSIC]);
+		load_wav("romfs:/audio/gunshot.wav", &sounds[CH_GUNSHOT]);
+		load_wav("romfs:/audio/reload1.wav", &sounds[CH_RELOAD1]);
+		load_wav("romfs:/audio/reload2.wav", &sounds[CH_RELOAD2]);
+		setup_channel(CH_MUSIC, &sounds[CH_MUSIC]);
+		setup_channel(CH_GUNSHOT, &sounds[CH_GUNSHOT]);
+		setup_channel(CH_RELOAD1, &sounds[CH_RELOAD1]);
+		setup_channel(CH_RELOAD2, &sounds[CH_RELOAD2]);
+		play_sound(CH_MUSIC, &sounds[CH_MUSIC], true);
+	}
 
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 	C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
 	C2D_Prepare();
 
 	C3D_RenderTarget *top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+	C3D_RenderTarget *topRight = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
 	C3D_RenderTarget *bottom = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+	// Always render both eye targets every frame (menus/HUD draw identical,
+	// zero-parallax content to each; gameplay offsets the raycast camera
+	// per eye). gfxSet3D just permits the 3D slider to take effect -- the
+	// hardware itself blends down to a mono image when the slider is at 0,
+	// so there's no need to branch on slider position here.
+	gfxSet3D(true);
 
 	C2D_SpriteSheet uiSheet = C2D_SpriteSheetLoad("romfs:/gfx/sprites.t3x");
 	C2D_SpriteSheet wallSheet = C2D_SpriteSheetLoad("romfs:/gfx/walltex.t3x");
@@ -304,6 +756,8 @@ int main(int argc, char **argv) {
 	C2D_Image imgMuzzleflash  = C2D_SpriteSheetGetImage(uiSheet, sprites_muzzleflash_idx);
 	C2D_Image imgHudLoaded    = C2D_SpriteSheetGetImage(uiSheet, sprites_loadedgunonhud_idx);
 	C2D_Image imgHudUnloaded  = C2D_SpriteSheetGetImage(uiSheet, sprites_unloadedgunonhud_idx);
+	C2D_Image imgEnemy        = C2D_SpriteSheetGetImage(uiSheet, sprites_enemy_idx);
+	C2D_Image imgTitle        = C2D_SpriteSheetGetImage(uiSheet, sprites_title_idx);
 	C2D_Image imgWall         = C2D_SpriteSheetGetImage(wallSheet, walltex_idx);
 
 	C2D_TextBuf textBuf = C2D_TextBufNew(1024);
@@ -328,18 +782,39 @@ int main(int argc, char **argv) {
 	u64 lastReadTitleId = 0;
 
 	float muzzleFlashTimer = 0.0f;
+	float animClock = 0.0f;
 
 	Enemy enemies[MAX_ENEMIES];
 	memset(enemies, 0, sizeof(enemies));
+	DeathEffect deathEffects[MAX_DEATH_EFFECTS];
+	memset(deathEffects, 0, sizeof(deathEffects));
 	int health = PLAYER_MAX_HEALTH;
 	int wave = 1;
 	int kills = 0;
+	int score = 0;
+	// Tracks whether the player has taken damage during the current wave,
+	// for the no-damage wave-clear bonus -- reset when a new wave starts.
+	bool waveDamageTaken = false;
 	int enemiesQuotaThisWave = 0;
 	int enemiesSpawnedThisWave = 0;
 	float spawnTimer = 0.0f;
 	bool waveBreak = false;
 	float waveBreakTimer = 0.0f;
 	int finalWave = 0;
+	u32 waveTintColor = C2D_Color32(0, 0, 0, 255);
+
+	// --- multiplayer state ---
+	MpRole mpRole = MP_OFF;
+	udsBindContext mpBindCtx;
+	bool mpBound = false;
+	u16 mpMyNodeID = UDS_HOST_NETWORKNODEID;
+	float mpSendTimer = 0.0f;
+	bool mpPendingFire = false;
+	RemotePlayer remotePlayers[MP_MAX_PLAYERS];
+	memset(remotePlayers, 0, sizeof(remotePlayers));
+	int mpClientHealth[MP_MAX_PLAYERS]; // host's authoritative HP tracking for each client slot
+	memset(mpClientHealth, 0, sizeof(mpClientHealth));
+	char mpErrorMsg[64] = "";
 
 	u64 lastTime = svcGetSystemTick();
 
@@ -359,17 +834,25 @@ int main(int argc, char **argv) {
 			if (kDown & KEY_SELECT) {
 				immersion = (Immersion)((immersion + 1) % IMM_COUNT);
 			}
+			if (mpAvailable && (kDown & KEY_X)) {
+				mpErrorMsg[0] = '\0';
+				screen = SCREEN_MP_MENU;
+			}
 			if (kDown & KEY_R) {
-				// start a run -- immersion is now locked until death
+				// start a single-player run -- immersion is now locked until death
 				px = 4.5f; py = 4.5f; pa = 0.0f;
 				health = PLAYER_MAX_HEALTH;
 				wave = 1;
 				kills = 0;
+				score = 0;
+				waveDamageTaken = false;
 				enemiesQuotaThisWave = 2 + wave;
 				enemiesSpawnedThisWave = 0;
 				spawnTimer = 1.0f;
 				waveBreak = false;
+				waveTintColor = random_wave_color();
 				memset(enemies, 0, sizeof(enemies));
+				memset(deathEffects, 0, sizeof(deathEffects));
 				magCount = 0; // full mode starts each run with fresh magazines
 				hasLoadedCart = false;
 				loadedCartId = 0;
@@ -378,9 +861,133 @@ int main(int argc, char **argv) {
 				gunState = STATE_RELOADING;
 				FSUSER_CardSlotIsInserted(&prevCardInserted);
 				muzzleFlashTimer = 0.0f;
+				animClock = 0.0f;
+				mpRole = MP_OFF;
 				screen = SCREEN_PLAYING;
 			}
+		} else if (screen == SCREEN_MP_MENU) {
+			if (kDown & KEY_Y) {
+				screen = SCREEN_MENU;
+			}
+			if (kDown & KEY_A) {
+				if (mp_host_create(&mpBindCtx)) {
+					mpRole = MP_HOST;
+					mpBound = true;
+					mpMyNodeID = UDS_HOST_NETWORKNODEID;
+					memset(remotePlayers, 0, sizeof(remotePlayers));
+					memset(mpClientHealth, 0, sizeof(mpClientHealth));
+					mpErrorMsg[0] = '\0';
+					screen = SCREEN_MP_LOBBY;
+				} else {
+					snprintf(mpErrorMsg, sizeof(mpErrorMsg), "Failed to create network. Try again.");
+				}
+			}
+			if (kDown & KEY_B) {
+				if (mp_client_scan_and_connect(&mpBindCtx)) {
+					mpRole = MP_CLIENT;
+					mpBound = true;
+					udsConnectionStatus constatus;
+					if (R_SUCCEEDED(udsGetConnectionStatus(&constatus))) {
+						mpMyNodeID = constatus.cur_NetworkNodeID;
+					}
+					memset(remotePlayers, 0, sizeof(remotePlayers));
+					mpErrorMsg[0] = '\0';
+					screen = SCREEN_MP_LOBBY;
+				} else {
+					snprintf(mpErrorMsg, sizeof(mpErrorMsg), "No host found nearby. Try again.");
+				}
+			}
+		} else if (screen == SCREEN_MP_LOBBY) {
+			if (kDown & KEY_Y) {
+				if (mpRole == MP_HOST) udsDestroyNetwork();
+				else if (mpRole == MP_CLIENT) udsDisconnectNetwork();
+				if (mpBound) { udsUnbind(&mpBindCtx); mpBound = false; }
+				mpRole = MP_OFF;
+				screen = SCREEN_MP_MENU;
+			} else if (mpRole == MP_HOST) {
+				if (kDown & KEY_R) {
+					// redundant sends -- UDS isn't guaranteed-delivery, and
+					// this is the one signal every client absolutely must
+					// receive to leave the lobby
+					MpStartPacket startPkt = { PKT_HOST_START };
+					for (int i = 0; i < 5; i++) {
+						udsSendTo(UDS_BROADCAST_NETWORKNODEID, MP_DATA_CHANNEL, UDS_SENDFLAG_Default,
+							&startPkt, sizeof(startPkt));
+					}
+					px = 4.5f; py = 4.5f; pa = 0.0f;
+					health = PLAYER_MAX_HEALTH;
+					wave = 1;
+					kills = 0;
+					score = 0;
+					waveDamageTaken = false;
+					enemiesQuotaThisWave = 2 + wave;
+					enemiesSpawnedThisWave = 0;
+					spawnTimer = 1.0f;
+					waveBreak = false;
+					waveTintColor = random_wave_color();
+					memset(enemies, 0, sizeof(enemies));
+					memset(deathEffects, 0, sizeof(deathEffects));
+					// node_bitmask: bit i is set for NetworkNodeID (i+1), which is
+					// player slot i in our arrays -- this is the actual source of
+					// truth for who's connected right now, since clients don't
+					// send anything of their own while sitting in the lobby
+					udsConnectionStatus constatus;
+					memset(&constatus, 0, sizeof(constatus));
+					udsGetConnectionStatus(&constatus);
+					for (int i = 1; i < MP_MAX_PLAYERS; i++) {
+						bool connected = (constatus.node_bitmask & (1 << i)) != 0;
+						remotePlayers[i].connected = connected;
+						remotePlayers[i].alive = connected;
+						mpClientHealth[i] = connected ? PLAYER_MAX_HEALTH : 0;
+					}
+					magCount = 0;
+					hasLoadedCart = false;
+					loadedCartId = 0;
+					loadedMagIdx = -1;
+					ammo = 0;
+					gunState = STATE_RELOADING;
+					FSUSER_CardSlotIsInserted(&prevCardInserted);
+					muzzleFlashTimer = 0.0f;
+					animClock = 0.0f;
+					mpSendTimer = 0.0f;
+					screen = SCREEN_PLAYING;
+				}
+			} else if (mpRole == MP_CLIENT) {
+				// drain incoming packets looking for the host's start signal
+				u8 buf[UDS_DATAFRAME_MAXSIZE];
+				size_t actualSize = 0;
+				u16 srcNodeID = 0;
+				for (int guard = 0; guard < 16; guard++) {
+					Result r = udsPullPacket(&mpBindCtx, buf, sizeof(buf), &actualSize, &srcNodeID);
+					if (R_FAILED(r) || actualSize == 0) break;
+					if (actualSize >= 1 && buf[0] == PKT_HOST_START) {
+						px = 4.5f; py = 4.5f; pa = 0.0f;
+						health = PLAYER_MAX_HEALTH;
+						wave = 1;
+						kills = 0;
+						score = 0;
+						waveDamageTaken = false;
+						memset(enemies, 0, sizeof(enemies));
+						memset(deathEffects, 0, sizeof(deathEffects));
+						memset(remotePlayers, 0, sizeof(remotePlayers));
+						magCount = 0;
+						hasLoadedCart = false;
+						loadedCartId = 0;
+						loadedMagIdx = -1;
+						ammo = 0;
+						gunState = STATE_RELOADING;
+						FSUSER_CardSlotIsInserted(&prevCardInserted);
+						muzzleFlashTimer = 0.0f;
+						animClock = 0.0f;
+						mpSendTimer = 0.0f;
+						screen = SCREEN_PLAYING;
+						break;
+					}
+				}
+			}
 		} else if (screen == SCREEN_PLAYING) {
+			animClock += dt;
+
 			// Circle Pad: move forward/back and strafe left/right.
 			circlePosition cpos;
 			hidCircleRead(&cpos);
@@ -408,6 +1015,9 @@ int main(int argc, char **argv) {
 
 			pa += turnInput * TURN_SPEED * dt;
 
+			// Movement and the cartridge-reload state machine below are
+			// fully local regardless of multiplayer role -- each player's
+			// own position and their own cart slot are their own business.
 			const float HALF_PI = 1.57079632679f;
 			float nx = px + cosf(pa) * moveInput * MOVE_SPEED * dt
 			              + cosf(pa + HALF_PI) * strafeInput * MOVE_SPEED * dt;
@@ -424,6 +1034,7 @@ int main(int argc, char **argv) {
 				// cart pulled (even mid-check) -- gun goes dead no matter how
 				// much ammo is left, or how far along a pending ID check was
 				gunState = STATE_RELOADING;
+				play_sound(CH_RELOAD1, &sounds[CH_RELOAD1], false);
 			} else if (gunState == STATE_RELOADING && !prevCardInserted && cardInserted) {
 				if (immersion == IMM_BASE) {
 					// base mode never needs to identify the cart, so it can
@@ -432,6 +1043,7 @@ int main(int argc, char **argv) {
 					ammo = MAG_SIZE;
 					hasLoadedCart = true;
 					gunState = STATE_READY;
+					play_sound(CH_RELOAD2, &sounds[CH_RELOAD2], false);
 				} else {
 					// a cart just went back in, but AM_GetTitleList tends to
 					// come back empty if queried on the very same frame the
@@ -459,6 +1071,7 @@ int main(int argc, char **argv) {
 						loadedCartId = newId;
 						hasLoadedCart = true;
 						gunState = STATE_READY;
+						play_sound(CH_RELOAD2, &sounds[CH_RELOAD2], false);
 					} else {
 						gunState = STATE_RELOADING;
 					}
@@ -470,73 +1083,221 @@ int main(int argc, char **argv) {
 				ammo--;
 				if (immersion == IMM_FULL && loadedMagIdx >= 0) mags[loadedMagIdx].ammo = ammo;
 				muzzleFlashTimer = 0.08f;
+				play_sound(CH_GUNSHOT, &sounds[CH_GUNSHOT], false);
 
-				// hit the closest alive enemy roughly in front of the
-				// player, if there's a clear line of sight to it
-				int bestIdx = -1;
-				float bestDist = MAX_DEPTH;
-				for (int i = 0; i < MAX_ENEMIES; i++) {
-					if (!enemies[i].alive) continue;
-					float dx = enemies[i].x - px, dy = enemies[i].y - py;
-					float dist = sqrtf(dx * dx + dy * dy);
-					if (dist >= bestDist) continue;
-					float relAngle = normalize_angle(atan2f(dy, dx) - pa);
-					if (fabsf(relAngle) > ENEMY_AIM_TOLERANCE) continue;
-					if (!has_line_of_sight(px, py, enemies[i].x, enemies[i].y)) continue;
-					bestDist = dist;
-					bestIdx = i;
-				}
-				if (bestIdx >= 0) {
-					enemies[bestIdx].alive = false;
-					kills++;
+				if (mpRole == MP_CLIENT) {
+					// the host owns the enemy list in multiplayer -- report
+					// the shot instead of resolving it locally, or the two
+					// would desync
+					mpPendingFire = true;
+				} else {
+					// single-player or host: resolve the shot against the
+					// local (and, if hosting, authoritative) enemy list
+					try_hitscan(enemies, deathEffects, px, py, pa, wave,
+						immersion_score_multiplier(immersion), &kills, &score);
 				}
 			}
 			if (muzzleFlashTimer > 0.0f) muzzleFlashTimer -= dt;
 
-			// --- waves ---
-			if (waveBreak) {
-				waveBreakTimer -= dt;
-				if (waveBreakTimer <= 0.0f) {
-					wave++;
-					enemiesQuotaThisWave = 2 + wave;
-					enemiesSpawnedThisWave = 0;
-					waveBreak = false;
-				}
-			} else if (enemiesSpawnedThisWave < enemiesQuotaThisWave) {
-				spawnTimer -= dt;
-				if (spawnTimer <= 0.0f) {
-					spawn_enemy(enemies, px, py);
-					enemiesSpawnedThisWave++;
-					spawnTimer = 1.2f;
-				}
-			} else if (count_alive_enemies(enemies) == 0) {
-				waveBreak = true;
-				waveBreakTimer = 2.0f;
+			for (int i = 0; i < MAX_DEATH_EFFECTS; i++) {
+				if (!deathEffects[i].active) continue;
+				deathEffects[i].timer -= dt;
+				if (deathEffects[i].timer <= 0.0f) deathEffects[i].active = false;
 			}
 
-			// --- enemy movement + melee ---
-			for (int i = 0; i < MAX_ENEMIES; i++) {
-				if (!enemies[i].alive) continue;
-				float dx = px - enemies[i].x, dy = py - enemies[i].y;
-				float dist = sqrtf(dx * dx + dy * dy);
-				if (dist < ENEMY_MELEE_RANGE) {
-					enemies[i].alive = false;
-					health--;
-					if (health <= 0) {
+			if (mpRole != MP_CLIENT) {
+				// single-player and host both run the real simulation --
+				// waves, enemy AI, and melee against the local player. Host
+				// additionally does the same against connected remote
+				// players further below.
+				if (waveBreak) {
+					waveBreakTimer -= dt;
+					if (waveBreakTimer <= 0.0f) {
+						wave++;
+						enemiesQuotaThisWave = 2 + wave;
+						enemiesSpawnedThisWave = 0;
+						waveBreak = false;
+						waveTintColor = random_wave_color();
+						waveDamageTaken = false;
+					}
+				} else if (enemiesSpawnedThisWave < enemiesQuotaThisWave) {
+					spawnTimer -= dt;
+					if (spawnTimer <= 0.0f) {
+						spawn_enemy(enemies, px, py);
+						enemiesSpawnedThisWave++;
+						spawnTimer = 1.2f;
+					}
+				} else if (count_alive_enemies(enemies) == 0) {
+					waveBreak = true;
+					waveBreakTimer = 2.0f;
+					int scoreMult = immersion_score_multiplier(immersion);
+					score += SCORE_PER_WAVE_CLEAR * wave * scoreMult;
+					if (!waveDamageTaken) score += SCORE_NO_DAMAGE_WAVE * wave * scoreMult;
+				}
+
+				for (int i = 0; i < MAX_ENEMIES; i++) {
+					if (!enemies[i].alive) continue;
+					float dx = px - enemies[i].x, dy = py - enemies[i].y;
+					float dist = sqrtf(dx * dx + dy * dy);
+					if (dist < ENEMY_MELEE_RANGE) {
+						enemies[i].alive = false;
+						health--;
+						waveDamageTaken = true;
+						spawn_death_effect(deathEffects, enemies[i].x, enemies[i].y);
+						if (health <= 0 && mpRole == MP_OFF) {
+							finalWave = wave;
+							screen = SCREEN_GAMEOVER;
+						}
+						continue;
+					}
+					float mvx = dx / dist * ENEMY_SPEED * dt;
+					float mvy = dy / dist * ENEMY_SPEED * dt;
+					float newX = enemies[i].x + mvx;
+					float newY = enemies[i].y + mvy;
+					if (!wall_is_solid((int)newX, (int)enemies[i].y)) enemies[i].x = newX;
+					if (!wall_is_solid((int)enemies[i].x, (int)newY)) enemies[i].y = newY;
+				}
+
+				if (mpRole == MP_HOST) {
+					// melee against connected remote players
+					for (int i = 0; i < MAX_ENEMIES; i++) {
+						if (!enemies[i].alive) continue;
+						for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+							if (!remotePlayers[p].connected || mpClientHealth[p] <= 0) continue;
+							float dx = remotePlayers[p].x - enemies[i].x, dy = remotePlayers[p].y - enemies[i].y;
+							if (sqrtf(dx * dx + dy * dy) < ENEMY_MELEE_RANGE) {
+								enemies[i].alive = false;
+								mpClientHealth[p]--;
+								remotePlayers[p].alive = mpClientHealth[p] > 0;
+								spawn_death_effect(deathEffects, enemies[i].x, enemies[i].y);
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			// --- multiplayer networking tick ---
+			if (mpRole == MP_HOST) {
+				u8 buf[UDS_DATAFRAME_MAXSIZE];
+				size_t actualSize = 0;
+				u16 srcNodeID = 0;
+				for (int guard = 0; guard < 16; guard++) {
+					Result r = udsPullPacket(&mpBindCtx, buf, sizeof(buf), &actualSize, &srcNodeID);
+					if (R_FAILED(r) || actualSize == 0) break;
+					if (actualSize >= sizeof(MpInputPacket) && buf[0] == PKT_CLIENT_INPUT) {
+						MpInputPacket pkt;
+						memcpy(&pkt, buf, sizeof(pkt));
+						int idx = (int)srcNodeID - 1;
+						// connected/health were already seeded from the real UDS
+						// connection state when the host started the match (see
+						// SCREEN_MP_LOBBY) -- health only ever decreases from
+						// here via melee, never auto-heals on a packet arriving,
+						// or a client who died would get silently resurrected
+						// the next time their input packet showed up
+						if (idx >= 1 && idx < MP_MAX_PLAYERS && remotePlayers[idx].connected) {
+							remotePlayers[idx].x = pkt.px;
+							remotePlayers[idx].y = pkt.py;
+							if (pkt.firing && mpClientHealth[idx] > 0) {
+								try_hitscan(enemies, deathEffects, pkt.px, pkt.py, pkt.pa, wave,
+								immersion_score_multiplier(immersion), &kills, &score);
+							}
+						}
+					}
+				}
+
+				mpSendTimer -= dt;
+				if (mpSendTimer <= 0.0f) {
+					mpSendTimer = MP_TICK_INTERVAL;
+
+					bool allDead = (health <= 0);
+					for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+						if (remotePlayers[p].connected && mpClientHealth[p] > 0) allDead = false;
+					}
+
+					MpStatePacket statePkt;
+					memset(&statePkt, 0, sizeof(statePkt));
+					statePkt.type = PKT_HOST_STATE;
+					statePkt.wave = (u8)wave;
+					statePkt.waveTintColor = waveTintColor;
+					statePkt.gameOver = allDead ? 1 : 0;
+					statePkt.finalWave = (u8)wave;
+					statePkt.players[0].x = px;
+					statePkt.players[0].y = py;
+					statePkt.players[0].pa = pa;
+					statePkt.players[0].health = (u8)(health > 0 ? health : 0);
+					statePkt.players[0].alive = health > 0 ? 1 : 0;
+					statePkt.players[0].connected = 1;
+					for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+						statePkt.players[p].x = remotePlayers[p].x;
+						statePkt.players[p].y = remotePlayers[p].y;
+						statePkt.players[p].health = (u8)(mpClientHealth[p] > 0 ? mpClientHealth[p] : 0);
+						statePkt.players[p].alive = mpClientHealth[p] > 0 ? 1 : 0;
+						statePkt.players[p].connected = remotePlayers[p].connected ? 1 : 0;
+					}
+					for (int i = 0; i < MAX_ENEMIES; i++) {
+						statePkt.enemies[i].x = enemies[i].x;
+						statePkt.enemies[i].y = enemies[i].y;
+						statePkt.enemies[i].alive = enemies[i].alive ? 1 : 0;
+					}
+					udsSendTo(UDS_BROADCAST_NETWORKNODEID, MP_DATA_CHANNEL, UDS_SENDFLAG_Default,
+						&statePkt, sizeof(statePkt));
+
+					if (allDead) {
 						finalWave = wave;
 						screen = SCREEN_GAMEOVER;
 					}
-					continue;
 				}
-				float mvx = dx / dist * ENEMY_SPEED * dt;
-				float mvy = dy / dist * ENEMY_SPEED * dt;
-				float newX = enemies[i].x + mvx;
-				float newY = enemies[i].y + mvy;
-				if (!wall_is_solid((int)newX, (int)enemies[i].y)) enemies[i].x = newX;
-				if (!wall_is_solid((int)enemies[i].x, (int)newY)) enemies[i].y = newY;
+			} else if (mpRole == MP_CLIENT) {
+				mpSendTimer -= dt;
+				if (mpSendTimer <= 0.0f) {
+					mpSendTimer = MP_TICK_INTERVAL;
+					MpInputPacket inputPkt = { PKT_CLIENT_INPUT, px, py, pa, mpPendingFire ? (u8)1 : (u8)0 };
+					udsSendTo(UDS_BROADCAST_NETWORKNODEID, MP_DATA_CHANNEL, UDS_SENDFLAG_Default,
+						&inputPkt, sizeof(inputPkt));
+					mpPendingFire = false;
+				}
+
+				u8 buf[UDS_DATAFRAME_MAXSIZE];
+				size_t actualSize = 0;
+				u16 srcNodeID = 0;
+				for (int guard = 0; guard < 16; guard++) {
+					Result r = udsPullPacket(&mpBindCtx, buf, sizeof(buf), &actualSize, &srcNodeID);
+					if (R_FAILED(r) || actualSize == 0) break;
+					if (actualSize >= sizeof(MpStatePacket) && buf[0] == PKT_HOST_STATE) {
+						MpStatePacket statePkt;
+						memcpy(&statePkt, buf, sizeof(statePkt));
+
+						wave = statePkt.wave;
+						waveTintColor = statePkt.waveTintColor;
+						for (int i = 0; i < MAX_ENEMIES; i++) {
+							enemies[i].x = statePkt.enemies[i].x;
+							enemies[i].y = statePkt.enemies[i].y;
+							enemies[i].alive = statePkt.enemies[i].alive != 0;
+						}
+						int myIdx = mpMyNodeID - 1;
+						if (myIdx >= 0 && myIdx < MP_MAX_PLAYERS) {
+							health = statePkt.players[myIdx].health;
+						}
+						for (int p = 0; p < MP_MAX_PLAYERS; p++) {
+							remotePlayers[p].x = statePkt.players[p].x;
+							remotePlayers[p].y = statePkt.players[p].y;
+							remotePlayers[p].alive = statePkt.players[p].alive != 0;
+							remotePlayers[p].connected = statePkt.players[p].connected != 0;
+						}
+						if (statePkt.gameOver) {
+							finalWave = statePkt.finalWave;
+							screen = SCREEN_GAMEOVER;
+						}
+					}
+				}
 			}
 		} else if (screen == SCREEN_GAMEOVER) {
 			if (kDown & KEY_R) {
+				if (mpRole == MP_HOST) udsDestroyNetwork();
+				else if (mpRole == MP_CLIENT) udsDisconnectNetwork();
+				if (mpBound) { udsUnbind(&mpBindCtx); mpBound = false; }
+				mpRole = MP_OFF;
 				screen = SCREEN_MENU;
 			}
 		}
@@ -547,26 +1308,40 @@ int main(int argc, char **argv) {
 		// clear command) goes through a null pointer.
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 
+		// osGet3DSliderState() ranges 0.0 (off) .. 1.0 (max depth). The raycast
+		// itself runs identically for both eyes (same px/py/pa -- there's no
+		// camera move here); each eye's screen-space disparity per object is
+		// computed from that object's own distance via stereo_shift_px().
+		float slider3d = osGet3DSliderState();
+
 		if (screen == SCREEN_MENU) {
+			// top screen: the title art (already includes the "CART RIDGE"
+			// lettering, so no separately-drawn text over it)
 			C2D_TargetClear(top, C2D_Color32(10, 10, 20, 255));
 			C2D_SceneBegin(top);
-			C2D_TextBufClear(textBuf);
+			float titleScale = SCREEN_H / (float)imgTitle.subtex->height;
+			float titleDrawW = imgTitle.subtex->width * titleScale;
+			C2D_DrawImageAt(imgTitle, (SCREEN_W - titleDrawW) / 2.0f, 0.0f, 0.5f, NULL,
+				titleScale, titleScale);
 
-			C2D_Text titleText;
-			C2D_TextParse(&titleText, textBuf, "CART RIDGE");
-			C2D_TextOptimize(&titleText);
-			C2D_DrawText(&titleText, C2D_WithColor, 90.0f, 80.0f, 0.5f, 1.2f, 1.2f,
-				C2D_Color32(255, 255, 255, 255));
+			// right eye: identical, zero-parallax -- this is a flat title
+			// card, not a 3D scene, so both eyes just see the same image
+			C2D_TargetClear(topRight, C2D_Color32(10, 10, 20, 255));
+			C2D_SceneBegin(topRight);
+			C2D_DrawImageAt(imgTitle, (SCREEN_W - titleDrawW) / 2.0f, 0.0f, 0.5f, NULL,
+				titleScale, titleScale);
+
+			// bottom screen: tagline, immersion selector, controls
+			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
+			C2D_SceneBegin(bottom);
+			C2D_TextBufClear(textBuf);
 
 			C2D_Text subText;
 			C2D_TextParse(&subText, textBuf,
 				"Pull the cartridge to reload. Survive the waves.");
 			C2D_TextOptimize(&subText);
-			C2D_DrawText(&subText, C2D_WithColor, 40.0f, 140.0f, 0.5f, 0.5f, 0.5f,
+			C2D_DrawText(&subText, C2D_WithColor, 10.0f, 15.0f, 0.5f, 0.45f, 0.45f,
 				C2D_Color32(180, 180, 180, 255));
-
-			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
-			C2D_SceneBegin(bottom);
 
 			char line[64];
 			C2D_Text modeText;
@@ -579,20 +1354,104 @@ int main(int argc, char **argv) {
 			C2D_Text promptText;
 			C2D_TextParse(&promptText, textBuf,
 				"SELECT: change immersion level\n"
-				"R: start run (locks the level until you die)\n"
-				"START: quit");
+				"R: start solo run (locks the level until you die)\n");
 			C2D_TextOptimize(&promptText);
 			C2D_DrawText(&promptText, C2D_WithColor, 10.0f, 100.0f, 0.5f, 0.45f, 0.45f,
 				C2D_Color32(200, 200, 200, 255));
+
+			C2D_Text prompt2Text;
+			C2D_TextParse(&prompt2Text, textBuf,
+				mpAvailable ? "X: local multiplayer\nSTART: quit" : "START: quit");
+			C2D_TextOptimize(&prompt2Text);
+			C2D_DrawText(&prompt2Text, C2D_WithColor, 10.0f, 150.0f, 0.5f, 0.45f, 0.45f,
+				C2D_Color32(200, 200, 200, 255));
+		} else if (screen == SCREEN_MP_MENU) {
+			C2D_TargetClear(top, C2D_Color32(10, 10, 20, 255));
+			C2D_SceneBegin(top);
+			C2D_TextBufClear(textBuf);
+
+			C2D_Text titleText;
+			C2D_TextParse(&titleText, textBuf, "LOCAL MULTIPLAYER");
+			C2D_TextOptimize(&titleText);
+			C2D_DrawText(&titleText, C2D_WithColor, 60.0f, 90.0f, 0.5f, 0.9f, 0.9f,
+				C2D_Color32(255, 255, 255, 255));
+
+			C2D_TargetClear(topRight, C2D_Color32(10, 10, 20, 255));
+			C2D_SceneBegin(topRight);
+			C2D_DrawText(&titleText, C2D_WithColor, 60.0f, 90.0f, 0.5f, 0.9f, 0.9f,
+				C2D_Color32(255, 255, 255, 255));
+
+			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
+			C2D_SceneBegin(bottom);
+
+			C2D_Text menuText;
+			C2D_TextParse(&menuText, textBuf,
+				"A: Host a game (up to 4 players)\n"
+				"B: Join a nearby game\n"
+				"Y: back");
+			C2D_TextOptimize(&menuText);
+			C2D_DrawText(&menuText, C2D_WithColor, 10.0f, 30.0f, 0.5f, 0.5f, 0.5f,
+				C2D_Color32(220, 220, 220, 255));
+
+			if (mpErrorMsg[0]) {
+				C2D_Text errText;
+				C2D_TextParse(&errText, textBuf, mpErrorMsg);
+				C2D_TextOptimize(&errText);
+				C2D_DrawText(&errText, C2D_WithColor, 10.0f, 120.0f, 0.5f, 0.45f, 0.45f,
+					C2D_Color32(255, 140, 140, 255));
+			}
+		} else if (screen == SCREEN_MP_LOBBY) {
+			udsConnectionStatus constatus;
+			memset(&constatus, 0, sizeof(constatus));
+			udsGetConnectionStatus(&constatus);
+
+			C2D_TargetClear(top, C2D_Color32(10, 10, 20, 255));
+			C2D_SceneBegin(top);
+			C2D_TextBufClear(textBuf);
+
+			C2D_Text titleText;
+			C2D_TextParse(&titleText, textBuf, mpRole == MP_HOST ? "HOSTING" : "CONNECTED");
+			C2D_TextOptimize(&titleText);
+			C2D_DrawText(&titleText, C2D_WithColor, 100.0f, 60.0f, 0.5f, 1.0f, 1.0f,
+				C2D_Color32(120, 255, 160, 255));
+
+			char line[64];
+			C2D_Text countText;
+			snprintf(line, sizeof(line), "%d / %d players", constatus.total_nodes, MP_MAX_PLAYERS);
+			C2D_TextParse(&countText, textBuf, line);
+			C2D_TextOptimize(&countText);
+			C2D_DrawText(&countText, C2D_WithColor, 100.0f, 120.0f, 0.5f, 0.6f, 0.6f,
+				C2D_Color32(255, 255, 255, 255));
+
+			C2D_TargetClear(topRight, C2D_Color32(10, 10, 20, 255));
+			C2D_SceneBegin(topRight);
+			C2D_DrawText(&titleText, C2D_WithColor, 100.0f, 60.0f, 0.5f, 1.0f, 1.0f,
+				C2D_Color32(120, 255, 160, 255));
+			C2D_DrawText(&countText, C2D_WithColor, 100.0f, 120.0f, 0.5f, 0.6f, 0.6f,
+				C2D_Color32(255, 255, 255, 255));
+
+			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
+			C2D_SceneBegin(bottom);
+
+			C2D_Text promptText;
+			C2D_TextParse(&promptText, textBuf, mpRole == MP_HOST
+				? "SELECT: change your immersion level\nR: start the game\nY: cancel hosting"
+				: "SELECT: change your immersion level\nWaiting for the host to start...\nY: disconnect");
+			C2D_TextOptimize(&promptText);
+			C2D_DrawText(&promptText, C2D_WithColor, 10.0f, 30.0f, 0.5f, 0.45f, 0.45f,
+				C2D_Color32(220, 220, 220, 255));
 		} else if (screen == SCREEN_PLAYING) {
 			bool cardInserted = prevCardInserted; // set above this frame
+			bool enemiesFlipped = fmodf(animClock, ENEMY_FLIP_PERIOD * 2.0f) >= ENEMY_FLIP_PERIOD;
+			int myIdx = (mpRole == MP_OFF) ? -1 : (int)mpMyNodeID - 1;
 
-			// top screen: the raycast view + enemies + viewmodel
-			C2D_TargetClear(top, C2D_Color32(10, 10, 15, 255));
-			C2D_SceneBegin(top);
-			draw_frame(px, py, pa, imgWall);
-			draw_enemies(enemies, px, py, pa);
-
+			// top screen: the raycast view + enemies + other players + viewmodel,
+			// rendered once per eye with the camera shifted perpendicular to
+			// facing direction for stereo parallax. The gun viewmodel is
+			// drawn identically to both eyes (no shift) -- it's rendered as
+			// a screen-space overlay rather than a world object, and giving
+			// it its own parallax would need a separate near-plane
+			// convergence to look right instead of just uncomfortable.
 			C2D_Image gunImg = (gunState != STATE_READY) ? imgGunEmpty
 				: (muzzleFlashTimer > 0.0f) ? imgGunShooting : imgGunIdle;
 			// lower-right, mostly cropped off the bottom edge -- per mockup.
@@ -610,15 +1469,34 @@ int main(int argc, char **argv) {
 			const float gunScale = 2.0f;
 			float gunDrawX = gunX - gunImg.subtex->width * (gunScale - 1.0f) / 2.0f;
 			float gunDrawY = gunY - gunImg.subtex->height * (gunScale - 1.0f) / 2.0f;
-			C2D_DrawImageAt(gunImg, gunDrawX, gunDrawY, 0.6f, NULL, gunScale, gunScale);
 
-			if (muzzleFlashTimer > 0.0f) {
-				// rough muzzle position -- upper-right of the viewmodel,
-				// where the barrel sits in the source art; offsets scale
-				// with the gun so it tracks the bigger sprite
-				float mfX = gunDrawX + gunImg.subtex->width * gunScale - 30.0f * gunScale;
-				float mfY = gunDrawY - 5.0f * gunScale;
-				C2D_DrawImageAt(imgMuzzleflash, mfX, mfY, 0.55f, NULL, 1.0f, 1.0f);
+			// eyeSign: left eye (physical GFX_LEFT target) gets +1, right eye
+			// gets -1. Near objects (closer than STEREO_CONVERGE_DIST) then
+			// shift right in the left-eye image and left in the right-eye
+			// image -- "crossed" disparity, which is the correct/comfortable
+			// direction for near depth (matches how your eyes naturally
+			// converge on something close in real life). Getting this
+			// backwards is what produced the reversed, nauseating effect.
+			for (int eye = 0; eye < 2; eye++) {
+				C3D_RenderTarget *eyeTarget = (eye == 0) ? top : topRight;
+				float eyeSign = (eye == 0) ? 1.0f : -1.0f;
+
+				C2D_TargetClear(eyeTarget, C2D_Color32(10, 10, 15, 255));
+				C2D_SceneBegin(eyeTarget);
+				draw_frame(px, py, pa, imgWall, waveTintColor, eyeSign, slider3d);
+				draw_enemies(enemies, px, py, pa, imgEnemy, enemiesFlipped, eyeSign, slider3d);
+				draw_death_effects(deathEffects, px, py, pa, imgMuzzleflash, eyeSign, slider3d);
+				if (mpRole != MP_OFF) draw_remote_players(remotePlayers, myIdx, px, py, pa, eyeSign, slider3d);
+
+				C2D_DrawImageAt(gunImg, gunDrawX, gunDrawY, 0.6f, NULL, gunScale, gunScale);
+				if (muzzleFlashTimer > 0.0f) {
+					// rough muzzle position -- upper-right of the viewmodel,
+					// where the barrel sits in the source art; offsets scale
+					// with the gun so it tracks the bigger sprite
+					float mfX = gunDrawX + gunImg.subtex->width * gunScale - 30.0f * gunScale;
+					float mfY = gunDrawY - 5.0f * gunScale;
+					C2D_DrawImageAt(imgMuzzleflash, mfX, mfY, 0.55f, NULL, 1.0f, 1.0f);
+				}
 			}
 
 			// crosshair hidden for now -- it's not lined up with the barrel yet.
@@ -632,6 +1510,8 @@ int main(int argc, char **argv) {
 
 			C2D_Image hudImg = cardInserted ? imgHudLoaded : imgHudUnloaded;
 			C2D_DrawImageAt(hudImg, 10.0f, 10.0f, 0.5f, NULL, 1.0f, 1.0f);
+
+			draw_minimap(px, py, pa, enemies, mpRole, remotePlayers, myIdx);
 
 			C2D_TextBufClear(textBuf);
 
@@ -654,8 +1534,13 @@ int main(int argc, char **argv) {
 			C2D_DrawText(&statusText, C2D_WithColor, 10.0f, 110.0f, 0.5f, 0.6f, 0.6f, statusColor);
 
 			C2D_Text statsText;
-			snprintf(line, sizeof(line), "Wave %d   HP %d/%d   Kills %d", wave, health,
-				PLAYER_MAX_HEALTH, kills);
+			if (mpRole == MP_OFF) {
+				snprintf(line, sizeof(line), "Wave %d   HP %d/%d   Score %d", wave, health,
+					PLAYER_MAX_HEALTH, score);
+			} else {
+				snprintf(line, sizeof(line), "Wave %d   HP %d/%d   %s", wave, health,
+					PLAYER_MAX_HEALTH, mpRole == MP_HOST ? "HOST" : "CLIENT");
+			}
 			C2D_TextParse(&statsText, textBuf, line);
 			C2D_TextOptimize(&statsText);
 			C2D_DrawText(&statsText, C2D_WithColor, 10.0f, 140.0f, 0.5f, 0.5f, 0.5f,
@@ -703,25 +1588,49 @@ int main(int argc, char **argv) {
 			C2D_DrawText(&waveText, C2D_WithColor, 90.0f, 140.0f, 0.5f, 0.55f, 0.55f,
 				C2D_Color32(220, 220, 220, 255));
 
+			C2D_TargetClear(topRight, C2D_Color32(20, 10, 10, 255));
+			C2D_SceneBegin(topRight);
+			C2D_DrawText(&overText, C2D_WithColor, 100.0f, 80.0f, 0.5f, 1.2f, 1.2f,
+				C2D_Color32(255, 120, 120, 255));
+			C2D_DrawText(&waveText, C2D_WithColor, 90.0f, 140.0f, 0.5f, 0.55f, 0.55f,
+				C2D_Color32(220, 220, 220, 255));
+
 			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
 			C2D_SceneBegin(bottom);
+
+			C2D_Text scoreText;
+			snprintf(line, sizeof(line), "Score: %d", score);
+			C2D_TextParse(&scoreText, textBuf, line);
+			C2D_TextOptimize(&scoreText);
+			C2D_DrawText(&scoreText, C2D_WithColor, 10.0f, 20.0f, 0.5f, 0.7f, 0.7f,
+				C2D_Color32(255, 220, 120, 255));
 
 			C2D_Text killsText;
 			snprintf(line, sizeof(line), "Kills: %d   Mode: %s", kills, immersion_name(immersion));
 			C2D_TextParse(&killsText, textBuf, line);
 			C2D_TextOptimize(&killsText);
-			C2D_DrawText(&killsText, C2D_WithColor, 10.0f, 60.0f, 0.5f, 0.55f, 0.55f,
+			C2D_DrawText(&killsText, C2D_WithColor, 10.0f, 65.0f, 0.5f, 0.55f, 0.55f,
 				C2D_Color32(255, 255, 255, 255));
 
 			C2D_Text retryText;
 			C2D_TextParse(&retryText, textBuf, "R: return to menu\nSTART: quit");
 			C2D_TextOptimize(&retryText);
-			C2D_DrawText(&retryText, C2D_WithColor, 10.0f, 100.0f, 0.5f, 0.45f, 0.45f,
+			C2D_DrawText(&retryText, C2D_WithColor, 10.0f, 105.0f, 0.5f, 0.45f, 0.45f,
 				C2D_Color32(200, 200, 200, 255));
 		}
 
 		C3D_FrameEnd(0);
 	}
+
+	if (mpRole == MP_HOST) udsDestroyNetwork();
+	else if (mpRole == MP_CLIENT) udsDisconnectNetwork();
+	if (mpBound) udsUnbind(&mpBindCtx);
+	if (mpAvailable) udsExit();
+
+	for (int i = 0; i < 4; i++) {
+		if (sounds[i].data) linearFree(sounds[i].data);
+	}
+	if (audioReady) ndspExit();
 
 	C2D_TextBufDelete(textBuf);
 	C2D_SpriteSheetFree(wallSheet);
