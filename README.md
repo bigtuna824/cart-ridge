@@ -42,6 +42,12 @@ sitting next to it for every test of the reload mechanic. Everything else
   the current wave number, and then by the locked-in immersion level (BASE
   1x, MEDIUM 2x, FULL 3x), since the stricter levels are harder to play
   under.
+- Minimap on the bottom screen (to the right of the existing HUD text): a
+  full radar, not line-of-sight-limited -- enemies (red) and, in
+  multiplayer, other players (their own colors) always show their real
+  position regardless of walls in between, since the point is to always
+  know where the threats are. Your own position and facing direction show
+  as a green dot with a short line.
 - Real title screen (`gfx/title.png`) instead of placeholder text.
 - Sound via NDSP: gunshot on fire, distinct cues for pulling
   (`audio/reload1.wav`) vs. inserting (`audio/reload2.wav`) a cartridge,

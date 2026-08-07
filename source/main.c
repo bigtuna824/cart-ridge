@@ -655,6 +655,55 @@ static void draw_remote_players(RemotePlayer* players, int myIdx, float px, floa
 	}
 }
 
+// Bottom-screen minimap -- lives in the unused space to the right of the
+// existing HUD text (which stops around x=180). This is a full radar, not
+// a line-of-sight-limited map: enemies (and other players) always show up
+// at their real position regardless of walls between them and you, since
+// the point is to always know where the threats are.
+#define MINIMAP_PX_PER_TILE 9.0f
+#define MINIMAP_ORIGIN_X    215.0f
+#define MINIMAP_ORIGIN_Y    10.0f
+
+static void draw_minimap(float px, float py, float pa, Enemy* enemies, MpRole mpRole,
+		RemotePlayer* remotePlayers, int myIdx) {
+	float ox = MINIMAP_ORIGIN_X, oy = MINIMAP_ORIGIN_Y;
+	float mapPx = MAP_SIZE * MINIMAP_PX_PER_TILE;
+
+	C2D_DrawRectSolid(ox - 2.0f, oy - 2.0f, 0.5f, mapPx + 4.0f, mapPx + 4.0f, C2D_Color32(0, 0, 0, 220));
+
+	for (int y = 0; y < MAP_SIZE; y++) {
+		for (int x = 0; x < MAP_SIZE; x++) {
+			u32 color = wall_is_solid(x, y) ? C2D_Color32(100, 100, 120, 255) : C2D_Color32(30, 30, 42, 255);
+			C2D_DrawRectSolid(ox + x * MINIMAP_PX_PER_TILE, oy + y * MINIMAP_PX_PER_TILE, 0.5f,
+				MINIMAP_PX_PER_TILE, MINIMAP_PX_PER_TILE, color);
+		}
+	}
+
+	for (int i = 0; i < MAX_ENEMIES; i++) {
+		if (!enemies[i].alive) continue;
+		float ex = ox + enemies[i].x * MINIMAP_PX_PER_TILE;
+		float ey = oy + enemies[i].y * MINIMAP_PX_PER_TILE;
+		C2D_DrawRectSolid(ex - 2.0f, ey - 2.0f, 0.52f, 4.0f, 4.0f, C2D_Color32(255, 60, 60, 255));
+	}
+
+	if (mpRole != MP_OFF) {
+		for (int i = 0; i < MP_MAX_PLAYERS; i++) {
+			if (i == myIdx || !remotePlayers[i].connected || !remotePlayers[i].alive) continue;
+			float rx = ox + remotePlayers[i].x * MINIMAP_PX_PER_TILE;
+			float ry = oy + remotePlayers[i].y * MINIMAP_PX_PER_TILE;
+			C2D_DrawRectSolid(rx - 2.0f, ry - 2.0f, 0.52f, 4.0f, 4.0f, player_color(i));
+		}
+	}
+
+	float pxm = ox + px * MINIMAP_PX_PER_TILE;
+	float pym = oy + py * MINIMAP_PX_PER_TILE;
+	u32 playerColor = C2D_Color32(120, 255, 120, 255);
+	float facingX = pxm + cosf(pa) * 10.0f;
+	float facingY = pym + sinf(pa) * 10.0f;
+	C2D_DrawLine(pxm, pym, playerColor, facingX, facingY, playerColor, 2.0f, 0.53f);
+	C2D_DrawRectSolid(pxm - 2.0f, pym - 2.0f, 0.54f, 4.0f, 4.0f, playerColor);
+}
+
 int main(int argc, char **argv) {
 	gfxInitDefault();
 	// hid and fs are already brought up by libctru's default __appInit, so
@@ -1461,6 +1510,8 @@ int main(int argc, char **argv) {
 
 			C2D_Image hudImg = cardInserted ? imgHudLoaded : imgHudUnloaded;
 			C2D_DrawImageAt(hudImg, 10.0f, 10.0f, 0.5f, NULL, 1.0f, 1.0f);
+
+			draw_minimap(px, py, pa, enemies, mpRole, remotePlayers, myIdx);
 
 			C2D_TextBufClear(textBuf);
 
