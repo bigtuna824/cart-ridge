@@ -64,6 +64,30 @@
 #define MAX_DEATH_EFFECTS     8
 #define DEATH_EFFECT_DURATION 0.25f
 
+// Gun viewmodel animation. idle/idle2 alternate continuously at this rate;
+// fire1/fire2/reset play once (in that order) over FIRE_FRAME_COUNT frames
+// each time the player shoots.
+#define GUN_ANIM_FPS         12.0f
+#define GUN_FRAME_PERIOD     (1.0f / GUN_ANIM_FPS)
+#define GUN_FIRE_FRAME_COUNT 3
+#define GUN_FIRE_DURATION    (GUN_FIRE_FRAME_COUNT * GUN_FRAME_PERIOD)
+
+// How far (in screen px, at the gun's draw scale) the viewmodel drops when
+// out of ammo/reloading vs. its normal raised position, and how quickly it
+// eases between the two -- higher LOWER_SPEED snaps faster, lower is a
+// slower settle.
+#define GUN_LOWER_AMOUNT 40.0f
+#define GUN_LOWER_SPEED  8.0f
+
+// Classic DOOM-style weapon sway while moving: a horizontal side-to-side
+// sway plus a vertical bob at twice the frequency (so it dips on every
+// half-stride, not just once per full left-right cycle). Both scale with
+// how much the player is actually moving, so the sway settles back to
+// nothing when standing still rather than freezing mid-swing.
+#define GUN_SWAY_SPEED     6.0f
+#define GUN_SWAY_AMOUNT_X  6.0f
+#define GUN_SWAY_AMOUNT_Y  5.0f
+
 // NDSP channels -- one dedicated channel per sound so overlapping triggers
 // (e.g. firing again before the last shot's sound finished) just restart
 // that channel instead of needing a general-purpose mixer/voice pool.
@@ -748,12 +772,24 @@ int main(int argc, char **argv) {
 	C2D_SpriteSheet uiSheet = C2D_SpriteSheetLoad("romfs:/gfx/sprites.t3x");
 	C2D_SpriteSheet wallSheet = C2D_SpriteSheetLoad("romfs:/gfx/walltex.t3x");
 
-	C2D_Image imgGunIdle      = C2D_SpriteSheetGetImage(uiSheet, sprites_gunidle_idx);
-	C2D_Image imgGunShooting  = C2D_SpriteSheetGetImage(uiSheet, sprites_gunshooting_idx);
-	C2D_Image imgGunEmpty     = C2D_SpriteSheetGetImage(uiSheet, sprites_gunempty_idx);
+	// idle/idle2 alternate as a 2-frame idle animation; fire1/fire2/reset
+	// play once as a 3-frame sequence on each shot; empty is a single
+	// static pose. All swapped in for the old single-pose sprites.
+	C2D_Image imgGunIdle[2] = {
+		C2D_SpriteSheetGetImage(uiSheet, sprites_idle_idx),
+		C2D_SpriteSheetGetImage(uiSheet, sprites_idle2_idx),
+	};
+	C2D_Image imgGunFire[3] = {
+		C2D_SpriteSheetGetImage(uiSheet, sprites_fire1_idx),
+		C2D_SpriteSheetGetImage(uiSheet, sprites_fire2_idx),
+		C2D_SpriteSheetGetImage(uiSheet, sprites_reset_idx),
+	};
+	C2D_Image imgGunEmpty     = C2D_SpriteSheetGetImage(uiSheet, sprites_empty_idx);
 	C2D_Image imgCrosshair    = C2D_SpriteSheetGetImage(uiSheet, sprites_crosshair_idx);
 	(void)imgCrosshair; // drawing is disabled below until it's aligned to the barrel
-	C2D_Image imgMuzzleflash  = C2D_SpriteSheetGetImage(uiSheet, sprites_muzzleflash_idx);
+	// Used only for the enemy death effect now -- the gun's own muzzle
+	// flash is baked into the fire1/fire2/reset frames themselves.
+	C2D_Image imgExplosion   = C2D_SpriteSheetGetImage(uiSheet, sprites_explosion_idx);
 	C2D_Image imgHudLoaded    = C2D_SpriteSheetGetImage(uiSheet, sprites_loadedgunonhud_idx);
 	C2D_Image imgHudUnloaded  = C2D_SpriteSheetGetImage(uiSheet, sprites_unloadedgunonhud_idx);
 	C2D_Image imgEnemy        = C2D_SpriteSheetGetImage(uiSheet, sprites_enemy_idx);
@@ -781,8 +817,15 @@ int main(int argc, char **argv) {
 	u32 lastTitlesRead = 0;
 	u64 lastReadTitleId = 0;
 
-	float muzzleFlashTimer = 0.0f;
+	// Counts UP from 0 while a fire animation is playing (0 when idle),
+	// used to pick which of fire1/fire2/reset to show. Also still gates
+	// the old rapid-refire lockout behavior via GunState/ammo checks
+	// elsewhere -- unrelated to this timer directly.
+	float fireAnimTimer = -1.0f;
 	float animClock = 0.0f;
+	float gunLowerOffset = 0.0f; // eased toward GUN_LOWER_AMOUNT when not STATE_READY
+	float gunSwayPhase = 0.0f;
+	float gunSwayX = 0.0f, gunSwayY = 0.0f; // computed in the update phase, read back in the (separate) render phase below
 
 	Enemy enemies[MAX_ENEMIES];
 	memset(enemies, 0, sizeof(enemies));
@@ -860,8 +903,10 @@ int main(int argc, char **argv) {
 				ammo = 0;
 				gunState = STATE_RELOADING;
 				FSUSER_CardSlotIsInserted(&prevCardInserted);
-				muzzleFlashTimer = 0.0f;
+				fireAnimTimer = -1.0f;
 				animClock = 0.0f;
+				gunLowerOffset = 0.0f;
+				gunSwayPhase = 0.0f;
 				mpRole = MP_OFF;
 				screen = SCREEN_PLAYING;
 			}
@@ -947,8 +992,10 @@ int main(int argc, char **argv) {
 					ammo = 0;
 					gunState = STATE_RELOADING;
 					FSUSER_CardSlotIsInserted(&prevCardInserted);
-					muzzleFlashTimer = 0.0f;
+					fireAnimTimer = -1.0f;
 					animClock = 0.0f;
+					gunLowerOffset = 0.0f;
+					gunSwayPhase = 0.0f;
 					mpSendTimer = 0.0f;
 					screen = SCREEN_PLAYING;
 				}
@@ -977,8 +1024,10 @@ int main(int argc, char **argv) {
 						ammo = 0;
 						gunState = STATE_RELOADING;
 						FSUSER_CardSlotIsInserted(&prevCardInserted);
-						muzzleFlashTimer = 0.0f;
+						fireAnimTimer = -1.0f;
 						animClock = 0.0f;
+						gunLowerOffset = 0.0f;
+						gunSwayPhase = 0.0f;
 						mpSendTimer = 0.0f;
 						screen = SCREEN_PLAYING;
 						break;
@@ -1082,7 +1131,7 @@ int main(int argc, char **argv) {
 			if ((kDown & KEY_R) && gunState == STATE_READY && ammo > 0) {
 				ammo--;
 				if (immersion == IMM_FULL && loadedMagIdx >= 0) mags[loadedMagIdx].ammo = ammo;
-				muzzleFlashTimer = 0.08f;
+				fireAnimTimer = 0.0f;
 				play_sound(CH_GUNSHOT, &sounds[CH_GUNSHOT], false);
 
 				if (mpRole == MP_CLIENT) {
@@ -1097,7 +1146,23 @@ int main(int argc, char **argv) {
 						immersion_score_multiplier(immersion), &kills, &score);
 				}
 			}
-			if (muzzleFlashTimer > 0.0f) muzzleFlashTimer -= dt;
+			if (fireAnimTimer >= 0.0f) {
+				fireAnimTimer += dt;
+				if (fireAnimTimer >= GUN_FIRE_DURATION) fireAnimTimer = -1.0f;
+			}
+
+			// Weapon lower/raise: eases toward a lowered position whenever
+			// the gun isn't ready to fire, and back up to normal otherwise.
+			float gunLowerTarget = (gunState == STATE_READY) ? 0.0f : GUN_LOWER_AMOUNT;
+			gunLowerOffset += (gunLowerTarget - gunLowerOffset) * fminf(1.0f, GUN_LOWER_SPEED * dt);
+
+			// DOOM-style weapon sway: phase advances only while actually
+			// moving (scaled by how much), so it settles back to a neutral
+			// pose instead of freezing mid-swing when you stop.
+			float moveMagnitude = fminf(1.0f, sqrtf(moveInput * moveInput + strafeInput * strafeInput));
+			gunSwayPhase += moveMagnitude * GUN_SWAY_SPEED * dt;
+			gunSwayX = sinf(gunSwayPhase) * GUN_SWAY_AMOUNT_X * moveMagnitude;
+			gunSwayY = fabsf(sinf(gunSwayPhase * 2.0f)) * GUN_SWAY_AMOUNT_Y * moveMagnitude;
 
 			for (int i = 0; i < MAX_DEATH_EFFECTS; i++) {
 				if (!deathEffects[i].active) continue;
@@ -1452,23 +1517,28 @@ int main(int argc, char **argv) {
 			// a screen-space overlay rather than a world object, and giving
 			// it its own parallax would need a separate near-plane
 			// convergence to look right instead of just uncomfortable.
-			C2D_Image gunImg = (gunState != STATE_READY) ? imgGunEmpty
-				: (muzzleFlashTimer > 0.0f) ? imgGunShooting : imgGunIdle;
-			// lower-right, mostly cropped off the bottom edge -- per mockup.
-			// Tune these two if it still needs nudging: negative = left/up,
-			// positive = right/down.
-			const float gunNudgeX = -50.0f;
-			const float gunNudgeY = 102.0f;
-			float gunX = 3.0f * (SCREEN_W / 2.0f - gunImg.subtex->width / 2.0f) + gunNudgeX;
-			float gunY = (SCREEN_H - gunImg.subtex->height) / 2.0f + gunNudgeY;
-			// scaling grows the image from its top-left corner, which would
-			// otherwise fling most of it past the right/bottom edges given
-			// how close to those edges it's already anchored -- grow it
-			// around that same anchor point instead so it just gets
-			// chunkier in place
-			const float gunScale = 2.0f;
-			float gunDrawX = gunX - gunImg.subtex->width * (gunScale - 1.0f) / 2.0f;
-			float gunDrawY = gunY - gunImg.subtex->height * (gunScale - 1.0f) / 2.0f;
+			C2D_Image gunImg;
+			if (gunState != STATE_READY) {
+				gunImg = imgGunEmpty;
+			} else if (fireAnimTimer >= 0.0f) {
+				int frame = (int)(fireAnimTimer * GUN_ANIM_FPS);
+				if (frame >= GUN_FIRE_FRAME_COUNT) frame = GUN_FIRE_FRAME_COUNT - 1;
+				gunImg = imgGunFire[frame];
+			} else {
+				bool idle2 = fmodf(animClock, GUN_FRAME_PERIOD * 2.0f) >= GUN_FRAME_PERIOD;
+				gunImg = imgGunIdle[idle2 ? 1 : 0];
+			}
+			// The new sprites are already framed as a full viewmodel pose
+			// within their own canvas (unlike the old, tightly-cropped
+			// ones), so no scaling is needed -- just anchor the sprite's
+			// own bottom-right corner to the screen's. A small rightward
+			// nudge pushes the sprite's own right edge just past the
+			// visible screen area, since it was otherwise landing exactly
+			// on-screen and showing as a hard edge.
+			const float gunScale = 1.0f;
+			const float gunOffsetX = 10.0f;
+			float gunDrawX = SCREEN_W - gunImg.subtex->width * gunScale + gunOffsetX + gunSwayX;
+			float gunDrawY = SCREEN_H - gunImg.subtex->height * gunScale + gunLowerOffset + gunSwayY;
 
 			// eyeSign: left eye (physical GFX_LEFT target) gets +1, right eye
 			// gets -1. Near objects (closer than STEREO_CONVERGE_DIST) then
@@ -1485,18 +1555,12 @@ int main(int argc, char **argv) {
 				C2D_SceneBegin(eyeTarget);
 				draw_frame(px, py, pa, imgWall, waveTintColor, eyeSign, slider3d);
 				draw_enemies(enemies, px, py, pa, imgEnemy, enemiesFlipped, eyeSign, slider3d);
-				draw_death_effects(deathEffects, px, py, pa, imgMuzzleflash, eyeSign, slider3d);
+				draw_death_effects(deathEffects, px, py, pa, imgExplosion, eyeSign, slider3d);
 				if (mpRole != MP_OFF) draw_remote_players(remotePlayers, myIdx, px, py, pa, eyeSign, slider3d);
 
+				// No separate muzzle-flash overlay -- the fire1/fire2/reset
+				// frames already show it as part of the gun sprite itself.
 				C2D_DrawImageAt(gunImg, gunDrawX, gunDrawY, 0.6f, NULL, gunScale, gunScale);
-				if (muzzleFlashTimer > 0.0f) {
-					// rough muzzle position -- upper-right of the viewmodel,
-					// where the barrel sits in the source art; offsets scale
-					// with the gun so it tracks the bigger sprite
-					float mfX = gunDrawX + gunImg.subtex->width * gunScale - 30.0f * gunScale;
-					float mfY = gunDrawY - 5.0f * gunScale;
-					C2D_DrawImageAt(imgMuzzleflash, mfX, mfY, 0.55f, NULL, 1.0f, 1.0f);
-				}
 			}
 
 			// crosshair hidden for now -- it's not lined up with the barrel yet.
