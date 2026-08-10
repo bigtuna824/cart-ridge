@@ -184,6 +184,14 @@ $(GFXBUILD)/%.t3x $(BUILD)/%.h : %.t3s | $(BUILD) $(GFXBUILD)
 	@echo $(notdir $<)
 	@tex3ds -i $< -H $(BUILD)/$*.h -d $(BUILD)/$*.d -o $(GFXBUILD)/$*.t3x
 
+# The rule above only lists the .t3s spec itself as a prerequisite, so make
+# has no way to know the atlas depends on the individual PNGs it
+# references -- swapping out a sprite's art without touching the .t3s file
+# would otherwise leave the stale, already-built atlas in place forever.
+# tex3ds already emits a real dependency file (the -d flag above); this
+# just needs to actually be read.
+-include $(patsubst %.t3s,$(BUILD)/%.d,$(GFXFILES))
+
 #---------------------------------------------------------------------------------
 # audio/*.wav files are already in a usable format (16-bit PCM) so they just
 # get copied into the romfs as-is, no compilation step needed.

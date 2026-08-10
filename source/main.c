@@ -76,7 +76,7 @@
 // out of ammo/reloading vs. its normal raised position, and how quickly it
 // eases between the two -- higher LOWER_SPEED snaps faster, lower is a
 // slower settle.
-#define GUN_LOWER_AMOUNT 40.0f
+#define GUN_LOWER_AMOUNT 90.0f
 #define GUN_LOWER_SPEED  8.0f
 
 // Classic DOOM-style weapon sway while moving: a horizontal side-to-side
@@ -1537,8 +1537,9 @@ int main(int argc, char **argv) {
 			// on-screen and showing as a hard edge.
 			const float gunScale = 1.0f;
 			const float gunOffsetX = 10.0f;
+			const float gunOffsetY = 10.0f;
 			float gunDrawX = SCREEN_W - gunImg.subtex->width * gunScale + gunOffsetX + gunSwayX;
-			float gunDrawY = SCREEN_H - gunImg.subtex->height * gunScale + gunLowerOffset + gunSwayY;
+			float gunDrawY = SCREEN_H - gunImg.subtex->height * gunScale + gunOffsetY + gunLowerOffset + gunSwayY;
 
 			// eyeSign: left eye (physical GFX_LEFT target) gets +1, right eye
 			// gets -1. Near objects (closer than STEREO_CONVERGE_DIST) then
