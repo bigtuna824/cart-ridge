@@ -795,6 +795,11 @@ int main(int argc, char **argv) {
 	C2D_Image imgEnemy        = C2D_SpriteSheetGetImage(uiSheet, sprites_enemy_idx);
 	C2D_Image imgTitle        = C2D_SpriteSheetGetImage(uiSheet, sprites_title_idx);
 	C2D_Image imgWall         = C2D_SpriteSheetGetImage(wallSheet, walltex_idx);
+	// Top-screen overlay -- vignette + scratched scope glass + center
+	// reticle, drawn as a flat screen-space layer over everything else on
+	// the top screen (not the bottom-screen cartridge icon above, despite
+	// the similar name).
+	C2D_Image imgHudOverlay   = C2D_SpriteSheetGetImage(uiSheet, sprites_hud_idx);
 
 	C2D_TextBuf textBuf = C2D_TextBufNew(1024);
 
@@ -1562,6 +1567,12 @@ int main(int argc, char **argv) {
 				// No separate muzzle-flash overlay -- the fire1/fire2/reset
 				// frames already show it as part of the gun sprite itself.
 				C2D_DrawImageAt(gunImg, gunDrawX, gunDrawY, 0.6f, NULL, gunScale, gunScale);
+
+				// HUD overlay drawn last (topmost, over the gun too) -- it's
+				// a flat screen-space layer already sized to exactly fill
+				// the top screen, same identical draw for both eyes as the
+				// gun above.
+				C2D_DrawImageAt(imgHudOverlay, 0.0f, 0.0f, 0.65f, NULL, 1.0f, 1.0f);
 			}
 
 			// crosshair hidden for now -- it's not lined up with the barrel yet.
