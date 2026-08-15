@@ -76,10 +76,12 @@ SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 GFXFILES	:=	$(foreach dir,$(GRAPHICS),$(notdir $(wildcard $(dir)/*.t3s)))
 BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
 AUDIOFILES	:=	$(foreach dir,$(AUDIO),$(notdir $(wildcard $(dir)/*.wav)))
+FONTFILES	:=	$(foreach dir,$(GRAPHICS),$(notdir $(wildcard $(dir)/*.ttf)))
 
 export ROMFS_T3XFILES	:=	$(patsubst %.t3s,$(GFXBUILD)/%.t3x,$(GFXFILES))
 export T3XHFILES		:=	$(patsubst %.t3s,$(BUILD)/%.h,$(GFXFILES))
 export ROMFS_AUDIOFILES	:=	$(patsubst %,$(AUDIOBUILD)/%,$(AUDIOFILES))
+export ROMFS_FONTFILES	:=	$(patsubst %.ttf,$(GFXBUILD)/%.bcfnt,$(FONTFILES))
 
 #---------------------------------------------------------------------------------
 # use CXX for linking C++ projects, CC for standard C
@@ -146,7 +148,7 @@ endif
 .PHONY: $(BUILD) clean all cia
 
 #---------------------------------------------------------------------------------
-all: $(BUILD) $(GFXBUILD) $(ROMFS_T3XFILES) $(T3XHFILES) $(AUDIOBUILD) $(ROMFS_AUDIOFILES)
+all: $(BUILD) $(GFXBUILD) $(ROMFS_T3XFILES) $(T3XHFILES) $(AUDIOBUILD) $(ROMFS_AUDIOFILES) $(ROMFS_FONTFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 $(BUILD):
@@ -199,6 +201,15 @@ $(GFXBUILD)/%.t3x $(BUILD)/%.h : %.t3s | $(BUILD) $(GFXBUILD)
 $(AUDIOBUILD)/%.wav : %.wav | $(AUDIOBUILD)
 	@echo $(notdir $<)
 	@cp $< $@
+
+#---------------------------------------------------------------------------------
+# gfx/*.ttf -> romfs/gfx/*.bcfnt via mkbcfnt (ships alongside tex3ds in
+# devkitPro's 3dstools package, so if tex3ds already works, this should
+# too with no extra install).
+#---------------------------------------------------------------------------------
+$(GFXBUILD)/%.bcfnt : %.ttf | $(BUILD) $(GFXBUILD)
+	@echo $(notdir $<)
+	@mkbcfnt -o $(GFXBUILD)/$*.bcfnt $<
 
 #---------------------------------------------------------------------------------
 clean:

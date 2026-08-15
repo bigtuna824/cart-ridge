@@ -16,6 +16,7 @@
 #include "walltex.h"
 #include "title.h"
 #include "hud.h"
+#include "sky.h"
 
 #define SCREEN_W       400
 #define SCREEN_H       240
@@ -49,6 +50,10 @@
 #define STEREO_STRIP_OVERLAP_PX 1.5f
 #define STEREO_STRENGTH_PX   35.0f
 #define PI             3.14159265359f
+// Screen pixels the sky scrolls per radian of turning. Tuned by feel, not
+// derived from anything -- it just wants to feel like a natural pan, not
+// tied to any real angular unit the way the raycast projection is.
+#define SKY_SCROLL_PX_PER_RADIAN 250.0f
 #define MOVE_SPEED     2.2f   // map tiles per second
 #define TURN_SPEED     2.6f   // radians per second
 #define MAX_DEPTH      20.0f
@@ -64,7 +69,7 @@
 #define ENEMY_FLIP_PERIOD   0.3f   // seconds per flip half-cycle (walk animation)
 
 #define MAX_DEATH_EFFECTS     8
-#define DEATH_EFFECT_DURATION 0.4f
+#define DEATH_EFFECT_DURATION 0.8f
 
 // Gun viewmodel animation. idle/idle2 alternate continuously at this rate;
 // fire1/fire2/reset play once (in that order) over FIRE_FRAME_COUNT frames
@@ -209,7 +214,7 @@ typedef struct { float x, y; bool alive; } Enemy;
 // recomputed per frame -- that would make the splatter visibly jitter
 // instead of smoothly radiating outward) and stored in world units, same
 // convention as everything else this engine billboards.
-#define BLOOD_PARTICLES 6
+#define BLOOD_PARTICLES 12
 typedef struct {
 	float x, y;
 	float timer;
@@ -605,6 +610,34 @@ static float stereo_shift_px(float dist, float slider3d) {
 	return shiftPx;
 }
 
+// No real 3D geometry exists in this engine to wrap a texture around (it's
+// a 2D raycaster, not a true 3D pipeline) -- so instead of an actual
+// skybox mesh, the sky is a texture tiled above the horizon that scrolls
+// horizontally with the player's facing angle, the same trick classic
+// raycasters (Doom, Duke3D) used for skies. Scaled uniformly (not
+// stretched) so the stars stay round and don't blur out, then tiled
+// side by side -- draws only as many copies as are actually needed to
+// cover the screen at the current scroll offset, which is normally 3
+// given how much smaller than SCREEN_W one tile is. No stereo shift: at
+// "infinite" distance a real stereo camera pair would show zero
+// parallax between the two eyes anyway, so unlike everything else this
+// one is both simpler AND more correct with no per-eye offset at all.
+static void draw_sky(C2D_Image img, float pa) {
+	float horizon = SCREEN_H / 2.0f;
+	float scale = horizon / (float)img.subtex->height; // uniform -- keeps stars circular
+	float tileWidth = scale * (float)img.subtex->width;
+
+	float scrollX = fmodf(pa * SKY_SCROLL_PX_PER_RADIAN, tileWidth);
+	if (scrollX < 0.0f) scrollX += tileWidth;
+
+	for (int t = -1; t < 8; t++) {
+		float x = t * tileWidth - scrollX;
+		if (x > (float)SCREEN_W) break; // this and every later tile are off the right edge
+		if (x + tileWidth < 0.0f) continue; // this one's off the left edge, but a later one may not be
+		C2D_DrawImageAt(img, x, 0.0f, 0.2f, NULL, scale, scale);
+	}
+}
+
 // width of each rendered strip in pixels -- one C2D_DrawImageAt call is
 // issued per strip, and citro3d's command buffer can't take 400 individual
 // draw calls in one frame (that's what caused earlier crashes), so we
@@ -783,9 +816,9 @@ static void draw_enemies(Enemy* enemies, float px, float py, float pa, C2D_Image
 // Turquoise blood-splatter droplets on enemy death, radiating outward from
 // the death point and fading out over DEATH_EFFECT_DURATION. No source
 // art needed -- just a handful of small solid circles per burst.
-#define BLOOD_COLOR_R 48
-#define BLOOD_COLOR_G 213
-#define BLOOD_COLOR_B 200
+#define BLOOD_COLOR_R 12
+#define BLOOD_COLOR_G 92
+#define BLOOD_COLOR_B 86
 
 static void draw_death_effects(DeathEffect* effects, float px, float py, float pa,
 		float eyeSign, float slider3d) {
@@ -900,6 +933,7 @@ int main(int argc, char **argv) {
 	// tex3ds's max page size ("No atlas solution found"). Own standalone
 	// texture instead, same treatment as the wall.
 	C2D_SpriteSheet titleSheet = C2D_SpriteSheetLoad("romfs:/gfx/title.t3x");
+	C2D_SpriteSheet skySheet = C2D_SpriteSheetLoad("romfs:/gfx/sky.t3x");
 
 	// idle/idle2 alternate as a 2-frame idle animation; fire1/fire2/reset
 	// play once as a 3-frame sequence on each shot; empty is a single
@@ -916,16 +950,25 @@ int main(int argc, char **argv) {
 	C2D_Image imgGunEmpty     = C2D_SpriteSheetGetImage(uiSheet, sprites_empty_idx);
 	C2D_Image imgCrosshair    = C2D_SpriteSheetGetImage(uiSheet, sprites_crosshair_idx);
 	(void)imgCrosshair; // drawing is disabled below until it's aligned to the barrel
-	C2D_Image imgHudLoaded    = C2D_SpriteSheetGetImage(uiSheet, sprites_loadedgunonhud_idx);
-	C2D_Image imgHudUnloaded  = C2D_SpriteSheetGetImage(uiSheet, sprites_unloadedgunonhud_idx);
+	// The bottom-screen cartridge-status icon (loadedgunonhud.png /
+	// unloadedgunonhud.png) is off for now while a new sprite replaces it.
+	// Still compiled into the atlas (a new C2D_Image + draw call is all
+	// that's needed to bring it back once the new art is ready).
 	C2D_Image imgEnemy        = C2D_SpriteSheetGetImage(uiSheet, sprites_enemy_idx);
 	C2D_Image imgTitle        = C2D_SpriteSheetGetImage(titleSheet, title_idx);
 	C2D_Image imgWall         = C2D_SpriteSheetGetImage(wallSheet, walltex_idx);
+	C2D_Image imgSky          = C2D_SpriteSheetGetImage(skySheet, sky_idx);
 	// The scope/vignette HUD overlay (gfx/hud.png, gfx/hud.t3s) is on hold
 	// -- not currently loaded or drawn -- until a less obtrusive graphic
 	// replaces it. The asset and its standalone-texture pipeline are still
 	// in place, so wiring it back in later is just re-adding the load +
 	// draw calls.
+
+	// C2D_TextFontParse (used everywhere text is drawn) treats a NULL font
+	// as "use the system font", so this is safe to pass around even if
+	// loading somehow fails -- no separate fallback branch needed anywhere
+	// else in the file.
+	C2D_Font gameFont = C2D_FontLoad("romfs:/gfx/font.bcfnt");
 
 	C2D_TextBuf textBuf = C2D_TextBufNew(1024);
 
@@ -1660,7 +1703,7 @@ int main(int argc, char **argv) {
 			C2D_TextBufClear(textBuf);
 
 			C2D_Text subText;
-			C2D_TextParse(&subText, textBuf,
+			C2D_TextFontParse(&subText, gameFont, textBuf,
 				"Pull the cartridge to reload. Survive the waves.");
 			C2D_TextOptimize(&subText);
 			C2D_DrawText(&subText, C2D_WithColor, 10.0f, 15.0f, 0.5f, 0.45f, 0.45f,
@@ -1669,13 +1712,13 @@ int main(int argc, char **argv) {
 			char line[64];
 			C2D_Text modeText;
 			snprintf(line, sizeof(line), "Immersion: %s", immersion_name(immersion));
-			C2D_TextParse(&modeText, textBuf, line);
+			C2D_TextFontParse(&modeText, gameFont, textBuf, line);
 			C2D_TextOptimize(&modeText);
 			C2D_DrawText(&modeText, C2D_WithColor, 10.0f, 60.0f, 0.5f, 0.6f, 0.6f,
 				C2D_Color32(255, 255, 255, 255));
 
 			C2D_Text promptText;
-			C2D_TextParse(&promptText, textBuf,
+			C2D_TextFontParse(&promptText, gameFont, textBuf,
 				"SELECT: change immersion level\n"
 				"R: start solo run (locks the level until you die)\n");
 			C2D_TextOptimize(&promptText);
@@ -1683,7 +1726,7 @@ int main(int argc, char **argv) {
 				C2D_Color32(200, 200, 200, 255));
 
 			C2D_Text prompt2Text;
-			C2D_TextParse(&prompt2Text, textBuf,
+			C2D_TextFontParse(&prompt2Text, gameFont, textBuf,
 				mpAvailable ? "X: local multiplayer\nSTART: quit" : "START: quit");
 			C2D_TextOptimize(&prompt2Text);
 			C2D_DrawText(&prompt2Text, C2D_WithColor, 10.0f, 150.0f, 0.5f, 0.45f, 0.45f,
@@ -1694,7 +1737,7 @@ int main(int argc, char **argv) {
 			C2D_TextBufClear(textBuf);
 
 			C2D_Text titleText;
-			C2D_TextParse(&titleText, textBuf, "LOCAL MULTIPLAYER");
+			C2D_TextFontParse(&titleText, gameFont, textBuf, "LOCAL MULTIPLAYER");
 			C2D_TextOptimize(&titleText);
 			C2D_DrawText(&titleText, C2D_WithColor, 60.0f, 90.0f, 0.5f, 0.9f, 0.9f,
 				C2D_Color32(255, 255, 255, 255));
@@ -1715,14 +1758,14 @@ int main(int argc, char **argv) {
 				"Y: back",
 				mpMode == MP_MODE_VERSUS ? "VERSUS" : "CO-OP");
 			C2D_Text menuText;
-			C2D_TextParse(&menuText, textBuf, mpMenuLine);
+			C2D_TextFontParse(&menuText, gameFont, textBuf, mpMenuLine);
 			C2D_TextOptimize(&menuText);
 			C2D_DrawText(&menuText, C2D_WithColor, 10.0f, 30.0f, 0.5f, 0.5f, 0.5f,
 				C2D_Color32(220, 220, 220, 255));
 
 			if (mpErrorMsg[0]) {
 				C2D_Text errText;
-				C2D_TextParse(&errText, textBuf, mpErrorMsg);
+				C2D_TextFontParse(&errText, gameFont, textBuf, mpErrorMsg);
 				C2D_TextOptimize(&errText);
 				C2D_DrawText(&errText, C2D_WithColor, 10.0f, 120.0f, 0.5f, 0.45f, 0.45f,
 					C2D_Color32(255, 140, 140, 255));
@@ -1737,7 +1780,7 @@ int main(int argc, char **argv) {
 			C2D_TextBufClear(textBuf);
 
 			C2D_Text titleText;
-			C2D_TextParse(&titleText, textBuf, mpRole == MP_HOST ? "HOSTING" : "CONNECTED");
+			C2D_TextFontParse(&titleText, gameFont, textBuf, mpRole == MP_HOST ? "HOSTING" : "CONNECTED");
 			C2D_TextOptimize(&titleText);
 			C2D_DrawText(&titleText, C2D_WithColor, 100.0f, 60.0f, 0.5f, 1.0f, 1.0f,
 				C2D_Color32(120, 255, 160, 255));
@@ -1746,7 +1789,7 @@ int main(int argc, char **argv) {
 			C2D_Text countText;
 			snprintf(line, sizeof(line), "%d / %d players -- %s", constatus.total_nodes, MP_MAX_PLAYERS,
 				mpMode == MP_MODE_VERSUS ? "VERSUS" : "CO-OP");
-			C2D_TextParse(&countText, textBuf, line);
+			C2D_TextFontParse(&countText, gameFont, textBuf, line);
 			C2D_TextOptimize(&countText);
 			C2D_DrawText(&countText, C2D_WithColor, 60.0f, 120.0f, 0.5f, 0.6f, 0.6f,
 				C2D_Color32(255, 255, 255, 255));
@@ -1762,14 +1805,13 @@ int main(int argc, char **argv) {
 			C2D_SceneBegin(bottom);
 
 			C2D_Text promptText;
-			C2D_TextParse(&promptText, textBuf, mpRole == MP_HOST
+			C2D_TextFontParse(&promptText, gameFont, textBuf, mpRole == MP_HOST
 				? "SELECT: change your immersion level\nR: start the game\nY: cancel hosting"
 				: "SELECT: change your immersion level\nWaiting for the host to start...\nY: disconnect");
 			C2D_TextOptimize(&promptText);
 			C2D_DrawText(&promptText, C2D_WithColor, 10.0f, 30.0f, 0.5f, 0.45f, 0.45f,
 				C2D_Color32(220, 220, 220, 255));
 		} else if (screen == SCREEN_PLAYING) {
-			bool cardInserted = prevCardInserted; // set above this frame
 			bool enemiesFlipped = fmodf(animClock, ENEMY_FLIP_PERIOD * 2.0f) >= ENEMY_FLIP_PERIOD;
 			int myIdx = (mpRole == MP_OFF) ? -1 : (int)mpMyNodeID - 1;
 
@@ -1814,9 +1856,9 @@ int main(int argc, char **argv) {
 			C2D_Text pausedText, pausedHintText;
 			if (paused) {
 				C2D_TextBufClear(textBuf);
-				C2D_TextParse(&pausedText, textBuf, "PAUSED");
+				C2D_TextFontParse(&pausedText, gameFont, textBuf, "PAUSED");
 				C2D_TextOptimize(&pausedText);
-				C2D_TextParse(&pausedHintText, textBuf, "START: resume   Y: quit to menu");
+				C2D_TextFontParse(&pausedHintText, gameFont, textBuf, "START: resume   Y: quit to menu");
 				C2D_TextOptimize(&pausedHintText);
 			}
 			for (int eye = 0; eye < 2; eye++) {
@@ -1825,6 +1867,7 @@ int main(int argc, char **argv) {
 
 				C2D_TargetClear(eyeTarget, C2D_Color32(10, 10, 15, 255));
 				C2D_SceneBegin(eyeTarget);
+				draw_sky(imgSky, pa);
 				draw_floor(imgWall, eyeSign, slider3d);
 				draw_frame(px, py, pa, imgWall, waveTintColor, eyeSign, slider3d);
 				draw_enemies(enemies, px, py, pa, imgEnemy, enemiesFlipped, eyeSign, slider3d);
@@ -1849,19 +1892,17 @@ int main(int argc, char **argv) {
 			// float chY = SCREEN_H / 2.0f - imgCrosshair.subtex->height / 2.0f;
 			// C2D_DrawImageAt(imgCrosshair, chX, chY, 0.5f, NULL, 1.0f, 1.0f);
 
-			// bottom screen: cartridge-status icon, ammo, wave/health, controls
+			// bottom screen: ammo, wave/health, controls. The cartridge-status
+			// icon is off for now -- a new sprite is replacing it.
 			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
 			C2D_SceneBegin(bottom);
-
-			C2D_Image hudImg = cardInserted ? imgHudLoaded : imgHudUnloaded;
-			C2D_DrawImageAt(hudImg, 10.0f, 10.0f, 0.5f, NULL, 1.0f, 1.0f);
 
 			C2D_TextBufClear(textBuf);
 
 			char line[64];
 			C2D_Text ammoText;
 			snprintf(line, sizeof(line), "Ammo: %d / %d", ammo, MAG_SIZE);
-			C2D_TextParse(&ammoText, textBuf, line);
+			C2D_TextFontParse(&ammoText, gameFont, textBuf, line);
 			C2D_TextOptimize(&ammoText);
 			C2D_DrawText(&ammoText, C2D_WithColor, 10.0f, 85.0f, 0.5f, 0.6f, 0.6f,
 				C2D_Color32(255, 255, 255, 255));
@@ -1872,7 +1913,7 @@ int main(int argc, char **argv) {
 			u32 statusColor = (gunState == STATE_READY) ? C2D_Color32(120, 255, 120, 255)
 				: (gunState == STATE_CHECKING) ? C2D_Color32(255, 220, 120, 255)
 				: C2D_Color32(255, 120, 120, 255);
-			C2D_TextParse(&statusText, textBuf, statusStr);
+			C2D_TextFontParse(&statusText, gameFont, textBuf, statusStr);
 			C2D_TextOptimize(&statusText);
 			C2D_DrawText(&statusText, C2D_WithColor, 10.0f, 110.0f, 0.5f, 0.6f, 0.6f, statusColor);
 
@@ -1888,7 +1929,7 @@ int main(int argc, char **argv) {
 				snprintf(line, sizeof(line), "Wave %d   HP %d/%d   %s", wave, health,
 					PLAYER_MAX_HEALTH, mpRole == MP_HOST ? "HOST" : "CLIENT");
 			}
-			C2D_TextParse(&statsText, textBuf, line);
+			C2D_TextFontParse(&statsText, gameFont, textBuf, line);
 			C2D_TextOptimize(&statsText);
 			C2D_DrawText(&statsText, C2D_WithColor, 10.0f, 140.0f, 0.5f, 0.5f, 0.5f,
 				C2D_Color32(255, 220, 150, 255));
@@ -1902,14 +1943,14 @@ int main(int argc, char **argv) {
 					(unsigned long)(lastReadTitleId >> 32), (unsigned long)(lastReadTitleId & 0xFFFFFFFF),
 					(unsigned long)(loadedCartId >> 32), (unsigned long)(loadedCartId & 0xFFFFFFFF),
 					(unsigned long)lastTitlesRead, (unsigned long)lastAmResult);
-				C2D_TextParse(&debugText, textBuf, line);
+				C2D_TextFontParse(&debugText, gameFont, textBuf, line);
 				C2D_TextOptimize(&debugText);
 				C2D_DrawText(&debugText, C2D_WithColor, 10.0f, 160.0f, 0.5f, 0.35f, 0.35f,
 					C2D_Color32(255, 255, 100, 255));
 			}
 
 			C2D_Text helpText;
-			C2D_TextParse(&helpText, textBuf,
+			C2D_TextFontParse(&helpText, gameFont, textBuf,
 				"Circle Pad: move/strafe   C-Stick/Y+A: look   R: fire\n"
 				"Pull the Game Card to reload, reinsert to chamber.\n"
 				"START: pause");
@@ -1926,7 +1967,7 @@ int main(int argc, char **argv) {
 
 			char line[64];
 			C2D_Text overText;
-			C2D_TextParse(&overText, textBuf, versusOver
+			C2D_TextFontParse(&overText, gameFont, textBuf, versusOver
 				? ((mpVersusWinnerIdx == myIdx) ? "YOU WIN!" : "GAME OVER")
 				: "GAME OVER");
 			C2D_TextOptimize(&overText);
@@ -1946,7 +1987,7 @@ int main(int argc, char **argv) {
 			} else {
 				snprintf(line, sizeof(line), "You reached wave %d", finalWave);
 			}
-			C2D_TextParse(&waveText, textBuf, line);
+			C2D_TextFontParse(&waveText, gameFont, textBuf, line);
 			C2D_TextOptimize(&waveText);
 			C2D_DrawText(&waveText, C2D_WithColor, 90.0f, 140.0f, 0.5f, 0.55f, 0.55f,
 				C2D_Color32(220, 220, 220, 255));
@@ -1971,28 +2012,28 @@ int main(int argc, char **argv) {
 					if (!remotePlayers[p].connected && p != myIdx) continue;
 					n += snprintf(board + n, sizeof(board) - n, "Player %d: %d\n", p + 1, mpKills[p]);
 				}
-				C2D_TextParse(&scoreboardText, textBuf, board);
+				C2D_TextFontParse(&scoreboardText, gameFont, textBuf, board);
 				C2D_TextOptimize(&scoreboardText);
 				C2D_DrawText(&scoreboardText, C2D_WithColor, 10.0f, 20.0f, 0.5f, 0.55f, 0.55f,
 					C2D_Color32(255, 255, 255, 255));
 			} else {
 				C2D_Text scoreText;
 				snprintf(line, sizeof(line), "Score: %d", score);
-				C2D_TextParse(&scoreText, textBuf, line);
+				C2D_TextFontParse(&scoreText, gameFont, textBuf, line);
 				C2D_TextOptimize(&scoreText);
 				C2D_DrawText(&scoreText, C2D_WithColor, 10.0f, 20.0f, 0.5f, 0.7f, 0.7f,
 					C2D_Color32(255, 220, 120, 255));
 
 				C2D_Text killsText;
 				snprintf(line, sizeof(line), "Kills: %d   Mode: %s", kills, immersion_name(immersion));
-				C2D_TextParse(&killsText, textBuf, line);
+				C2D_TextFontParse(&killsText, gameFont, textBuf, line);
 				C2D_TextOptimize(&killsText);
 				C2D_DrawText(&killsText, C2D_WithColor, 10.0f, 65.0f, 0.5f, 0.55f, 0.55f,
 					C2D_Color32(255, 255, 255, 255));
 			}
 
 			C2D_Text retryText;
-			C2D_TextParse(&retryText, textBuf, "R: return to menu\nSTART: quit");
+			C2D_TextFontParse(&retryText, gameFont, textBuf, "R: return to menu\nSTART: quit");
 			C2D_TextOptimize(&retryText);
 			C2D_DrawText(&retryText, C2D_WithColor, 10.0f, 105.0f, 0.5f, 0.45f, 0.45f,
 				C2D_Color32(200, 200, 200, 255));
@@ -2011,10 +2052,12 @@ int main(int argc, char **argv) {
 	}
 	if (audioReady) ndspExit();
 
+	if (gameFont) C2D_FontFree(gameFont);
 	C2D_TextBufDelete(textBuf);
 	C2D_SpriteSheetFree(wallSheet);
 	C2D_SpriteSheetFree(uiSheet);
 	C2D_SpriteSheetFree(titleSheet);
+	C2D_SpriteSheetFree(skySheet);
 	C2D_Fini();
 	C3D_Fini();
 	romfsExit();
