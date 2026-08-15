@@ -14,6 +14,8 @@
 
 #include "sprites.h"
 #include "walltex.h"
+#include "title.h"
+#include "hud.h"
 
 #define SCREEN_W       400
 #define SCREEN_H       240
@@ -62,7 +64,7 @@
 #define ENEMY_FLIP_PERIOD   0.3f   // seconds per flip half-cycle (walk animation)
 
 #define MAX_DEATH_EFFECTS     8
-#define DEATH_EFFECT_DURATION 0.25f
+#define DEATH_EFFECT_DURATION 0.4f
 
 // Gun viewmodel animation. idle/idle2 alternate continuously at this rate;
 // fire1/fire2/reset play once (in that order) over FIRE_FRAME_COUNT frames
@@ -108,6 +110,13 @@
 #define MP_TICK_INTERVAL 0.05f  // 20Hz network send rate, decoupled from render rate
 
 typedef enum { MP_OFF, MP_HOST, MP_CLIENT } MpRole;
+// Co-op (wave-survival, same as solo but with company) vs. versus (free-
+// for-all deathmatch: no enemies, players damage each other, first to
+// VERSUS_KILL_TARGET kills wins). Chosen by the host before starting;
+// clients just inherit whatever the host picked, via PKT_HOST_START.
+typedef enum { MP_MODE_COOP, MP_MODE_VERSUS } MpMode;
+#define VERSUS_KILL_TARGET 5
+#define VERSUS_DAMAGE      1
 enum { PKT_CLIENT_INPUT = 1, PKT_HOST_STATE = 2, PKT_HOST_START = 3 };
 
 // Sent by each client to the host, at MP_TICK_INTERVAL.
@@ -127,11 +136,27 @@ typedef struct {
 	u8 gameOver;
 	u8 finalWave;
 	u32 waveTintColor;
-	struct { float x, y, pa; u8 health; u8 alive; u8 connected; } players[MP_MAX_PLAYERS];
+	u8 versusWinnerIdx; // 0xFF = no winner yet
+	struct {
+		float x, y, pa;
+		u8 health;
+		u8 alive;
+		u8 connected;
+		u8 kills;
+		// Bumped by the host every time this player respawns (versus
+		// mode). Position is otherwise self-authoritative -- each player
+		// reports their own x/y -- so this is the one case where the host
+		// needs to force a client's position instead of just trusting
+		// what they report. The client applies x/y whenever this differs
+		// from the last value it saw, which (unlike a one-shot flag) is
+		// robust to a dropped packet: it'll just catch up on any later
+		// packet that still carries the new number, not only the first.
+		u8 respawnSeq;
+	} players[MP_MAX_PLAYERS];
 	struct { float x, y; u8 alive; } enemies[MAX_ENEMIES];
 } MpStatePacket;
 
-typedef struct { u8 type; } MpStartPacket; // PKT_HOST_START
+typedef struct { u8 type; u8 mode; } MpStartPacket; // PKT_HOST_START
 
 // Other players as seen for rendering -- populated from received network
 // data, not simulated locally (that's the host's job).
@@ -178,7 +203,21 @@ typedef enum {
 } GameScreen;
 
 typedef struct { float x, y; bool alive; } Enemy;
-typedef struct { float x, y; float timer; bool active; } DeathEffect;
+
+// A turquoise blood-splatter particle burst on enemy death. Each droplet's
+// direction/travel-distance/size is randomized once at spawn (not
+// recomputed per frame -- that would make the splatter visibly jitter
+// instead of smoothly radiating outward) and stored in world units, same
+// convention as everything else this engine billboards.
+#define BLOOD_PARTICLES 6
+typedef struct {
+	float x, y;
+	float timer;
+	bool active;
+	float particleAngle[BLOOD_PARTICLES];
+	float particleDist[BLOOD_PARTICLES];
+	float particleSize[BLOOD_PARTICLES];
+} DeathEffect;
 
 static const char* immersion_name(Immersion imm) {
 	switch (imm) {
@@ -432,6 +471,11 @@ static void spawn_death_effect(DeathEffect* effects, float x, float y) {
 			effects[i].y = y;
 			effects[i].timer = DEATH_EFFECT_DURATION;
 			effects[i].active = true;
+			for (int p = 0; p < BLOOD_PARTICLES; p++) {
+				effects[i].particleAngle[p] = ((float)(rand() % 360)) * (PI / 180.0f);
+				effects[i].particleDist[p] = 0.05f + ((float)(rand() % 100) / 100.0f) * 0.10f;
+				effects[i].particleSize[p] = 0.02f + ((float)(rand() % 100) / 100.0f) * 0.03f;
+			}
 			return;
 		}
 	}
@@ -469,6 +513,81 @@ static void try_hitscan(Enemy* enemies, DeathEffect* effects, float fx, float fy
 	}
 }
 
+// Versus PvP hitscan -- same forgiving aim-cone-plus-line-of-sight search
+// as try_hitscan above, but against the OTHER players instead of enemies.
+// Player slot 0 is always the host; slots 1-3 are whichever clients are
+// connected. shooterIdx is excluded from its own search (can't hit
+// yourself). Returns the hit player's slot, or -1 for a miss.
+static int find_versus_hit(const float allX[MP_MAX_PLAYERS], const float allY[MP_MAX_PLAYERS],
+		const bool allAlive[MP_MAX_PLAYERS], int shooterIdx, float fx, float fy, float fa) {
+	int bestIdx = -1;
+	float bestDist = MAX_DEPTH;
+	for (int i = 0; i < MP_MAX_PLAYERS; i++) {
+		if (i == shooterIdx || !allAlive[i]) continue;
+		float dx = allX[i] - fx, dy = allY[i] - fy;
+		float dist = sqrtf(dx * dx + dy * dy);
+		if (dist >= bestDist) continue;
+		float relAngle = normalize_angle(atan2f(dy, dx) - fa);
+		if (fabsf(relAngle) > ENEMY_AIM_TOLERANCE) continue;
+		if (!has_line_of_sight(fx, fy, allX[i], allY[i])) continue;
+		bestDist = dist;
+		bestIdx = i;
+	}
+	return bestIdx;
+}
+
+// Picks a random open (non-wall) tile for a versus-mode respawn. Doesn't
+// bother avoiding other players like spawn_enemy avoids the player --
+// deathmatch respawns landing near someone isn't unusual or unfair the
+// way an enemy spawning on top of you would be.
+static void find_respawn_point(float* outX, float* outY) {
+	for (int tries = 0; tries < 50; tries++) {
+		int x = rand() % MAP_SIZE;
+		int y = rand() % MAP_SIZE;
+		if (wall_is_solid(x, y)) continue;
+		*outX = x + 0.5f;
+		*outY = y + 0.5f;
+		return;
+	}
+	*outX = 4.5f; *outY = 4.5f; // shouldn't happen on this map, but stay safe
+}
+
+// Applies one versus-mode hit: damages the victim (player slot 0 is
+// always the host, using hostHealth/hostPx/hostPy directly since those
+// aren't array-indexed like the rest; slots 1-3 are clients), and if that
+// drops them to 0 HP, respawns them at a random open tile, credits the
+// shooter with a kill, checks the win condition, and -- for a client
+// victim -- bumps their respawnSeq so the state broadcast tells them to
+// teleport (their position is normally self-reported, so the host can't
+// just move them: see MpStatePacket's respawnSeq field).
+static void versus_apply_hit(int shooterIdx, int hitIdx, int* hostHealth, float* hostPx, float* hostPy,
+		int mpClientHealth[MP_MAX_PLAYERS], RemotePlayer remotePlayers[MP_MAX_PLAYERS],
+		int mpKills[MP_MAX_PLAYERS], u8 mpRespawnSeq[MP_MAX_PLAYERS],
+		DeathEffect* deathEffects, int* mpVersusWinnerIdx) {
+	int* victimHealth = (hitIdx == 0) ? hostHealth : &mpClientHealth[hitIdx];
+	*victimHealth -= VERSUS_DAMAGE;
+	if (*victimHealth > 0) return;
+
+	float hitX = (hitIdx == 0) ? *hostPx : remotePlayers[hitIdx].x;
+	float hitY = (hitIdx == 0) ? *hostPy : remotePlayers[hitIdx].y;
+	spawn_death_effect(deathEffects, hitX, hitY);
+	mpKills[shooterIdx]++;
+
+	float rx, ry;
+	find_respawn_point(&rx, &ry);
+	*victimHealth = PLAYER_MAX_HEALTH;
+	if (hitIdx == 0) {
+		*hostPx = rx; *hostPy = ry;
+	} else {
+		remotePlayers[hitIdx].x = rx;
+		remotePlayers[hitIdx].y = ry;
+		remotePlayers[hitIdx].alive = true;
+		mpRespawnSeq[hitIdx]++;
+	}
+
+	if (mpKills[shooterIdx] >= VERSUS_KILL_TARGET) *mpVersusWinnerIdx = shooterIdx;
+}
+
 // Horizontal screen-space disparity for a point at the given distance.
 // Positive means "shift toward this eye's side of center for a near
 // object" -- the caller multiplies by +1 for the left eye and -1 for the
@@ -491,6 +610,41 @@ static float stereo_shift_px(float dist, float slider3d) {
 // draw calls in one frame (that's what caused earlier crashes), so we
 // cast fewer, wider rays instead of one per screen column.
 #define RENDER_STRIDE 4
+
+// A genuine per-pixel floor cast (sampling the texture separately for
+// every screen pixel below the horizon) isn't practical here -- citro2d
+// draws whole images, not individual texels, and the draw-call budget is
+// already tight just from the wall strips above (see RENDER_STRIDE). This
+// approximates a floor instead: a handful of horizontal bands, each the
+// wall texture stretched across the full screen width, darkened more the
+// closer a band is to the horizon (farther away). Not perspective-correct
+// per column, but cheap (FLOOR_BANDS draw calls per eye) and still reads
+// as a textured, shaded floor rather than a flat color.
+#define FLOOR_BANDS 8
+
+static void draw_floor(C2D_Image wallImg, float eyeSign, float slider3d) {
+	float horizon = SCREEN_H / 2.0f;
+	float bandHeight = (SCREEN_H - horizon) / (float)FLOOR_BANDS;
+	for (int i = 0; i < FLOOR_BANDS; i++) {
+		float y0 = horizon + i * bandHeight;
+		float midY = y0 + bandHeight * 0.5f;
+		float dist = (SCREEN_H / 2.0f) / (midY - SCREEN_H / 2.0f);
+		if (dist > MAX_DEPTH) dist = MAX_DEPTH;
+
+		// always noticeably darker than a wall at the same distance would
+		// be (floor should read as clearly "underfoot"), plus it fades
+		// further toward the horizon
+		float darken = 0.55f + 0.35f * (dist / MAX_DEPTH);
+		if (darken > 0.9f) darken = 0.9f;
+		C2D_ImageTint tint;
+		C2D_PlainImageTint(&tint, C2D_Color32(0, 0, 0, 255), darken);
+
+		float scaleX = (float)SCREEN_W / (float)wallImg.subtex->width;
+		float scaleY = bandHeight / (float)wallImg.subtex->height;
+		float drawX = eyeSign * stereo_shift_px(dist, slider3d);
+		C2D_DrawImageAt(wallImg, drawX, y0, 0.4f, &tint, scaleX, scaleY);
+	}
+}
 
 static void draw_frame(float px, float py, float pa, C2D_Image wallImg, u32 waveTintColor,
 		float eyeSign, float slider3d) {
@@ -626,22 +780,40 @@ static void draw_enemies(Enemy* enemies, float px, float py, float pa, C2D_Image
 	}
 }
 
-static void draw_death_effects(DeathEffect* effects, float px, float py, float pa, C2D_Image img,
+// Turquoise blood-splatter droplets on enemy death, radiating outward from
+// the death point and fading out over DEATH_EFFECT_DURATION. No source
+// art needed -- just a handful of small solid circles per burst.
+#define BLOOD_COLOR_R 48
+#define BLOOD_COLOR_G 213
+#define BLOOD_COLOR_B 200
+
+static void draw_death_effects(DeathEffect* effects, float px, float py, float pa,
 		float eyeSign, float slider3d) {
 	for (int i = 0; i < MAX_DEATH_EFFECTS; i++) {
 		if (!effects[i].active) continue;
 
 		float dx = effects[i].x - px, dy = effects[i].y - py;
 		float dist = sqrtf(dx * dx + dy * dy);
-		if (dist >= 0.1f && dist <= MAX_DEPTH) {
-			float relAngle = normalize_angle(atan2f(dy, dx) - pa);
-			if (fabsf(relAngle) <= FOV / 2.0f + 0.3f && has_line_of_sight(px, py, effects[i].x, effects[i].y)) {
-				float screenX = billboard_screen_x(relAngle);
-				float height = (SCREEN_H / dist) * 1.1f; // bigger than an enemy -- a death poof, not a normal sprite
-				float scale = height / (float)img.subtex->height;
-				float drawX = screenX - (img.subtex->width * scale) / 2.0f + eyeSign * stereo_shift_px(dist, slider3d);
-				C2D_DrawImageAt(img, drawX, SCREEN_H / 2.0f - height / 2.0f, 0.53f, NULL, scale, scale);
-			}
+		if (dist < 0.1f || dist > MAX_DEPTH) continue;
+		float relAngle = normalize_angle(atan2f(dy, dx) - pa);
+		if (fabsf(relAngle) > FOV / 2.0f + 0.3f) continue;
+		if (!has_line_of_sight(px, py, effects[i].x, effects[i].y)) continue;
+
+		float screenX = billboard_screen_x(relAngle) + eyeSign * stereo_shift_px(dist, slider3d);
+		float screenY = SCREEN_H / 2.0f;
+		float pxPerUnit = SCREEN_H / dist; // same world-unit-to-pixel convention as walls/enemies
+
+		float progress = 1.0f - (effects[i].timer / DEATH_EFFECT_DURATION); // 0 at spawn, 1 at end
+		u8 alpha = (u8)(255.0f * (1.0f - progress));
+
+		for (int p = 0; p < BLOOD_PARTICLES; p++) {
+			float travel = effects[i].particleDist[p] * progress;
+			float dropX = screenX + cosf(effects[i].particleAngle[p]) * travel * pxPerUnit;
+			float dropY = screenY + sinf(effects[i].particleAngle[p]) * travel * pxPerUnit;
+			float radius = effects[i].particleSize[p] * pxPerUnit;
+			if (radius < 0.5f) continue; // too small on screen to bother drawing
+			C2D_DrawCircleSolid(dropX, dropY, 0.53f, radius,
+				C2D_Color32(BLOOD_COLOR_R, BLOOD_COLOR_G, BLOOD_COLOR_B, alpha));
 		}
 	}
 }
@@ -677,55 +849,6 @@ static void draw_remote_players(RemotePlayer* players, int myIdx, float px, floa
 		C2D_DrawRectSolid(drawX, SCREEN_H / 2.0f - height / 2.0f, 0.515f,
 			width, height, C2D_Color32(r, g, b, 255));
 	}
-}
-
-// Bottom-screen minimap -- lives in the unused space to the right of the
-// existing HUD text (which stops around x=180). This is a full radar, not
-// a line-of-sight-limited map: enemies (and other players) always show up
-// at their real position regardless of walls between them and you, since
-// the point is to always know where the threats are.
-#define MINIMAP_PX_PER_TILE 9.0f
-#define MINIMAP_ORIGIN_X    215.0f
-#define MINIMAP_ORIGIN_Y    10.0f
-
-static void draw_minimap(float px, float py, float pa, Enemy* enemies, MpRole mpRole,
-		RemotePlayer* remotePlayers, int myIdx) {
-	float ox = MINIMAP_ORIGIN_X, oy = MINIMAP_ORIGIN_Y;
-	float mapPx = MAP_SIZE * MINIMAP_PX_PER_TILE;
-
-	C2D_DrawRectSolid(ox - 2.0f, oy - 2.0f, 0.5f, mapPx + 4.0f, mapPx + 4.0f, C2D_Color32(0, 0, 0, 220));
-
-	for (int y = 0; y < MAP_SIZE; y++) {
-		for (int x = 0; x < MAP_SIZE; x++) {
-			u32 color = wall_is_solid(x, y) ? C2D_Color32(100, 100, 120, 255) : C2D_Color32(30, 30, 42, 255);
-			C2D_DrawRectSolid(ox + x * MINIMAP_PX_PER_TILE, oy + y * MINIMAP_PX_PER_TILE, 0.5f,
-				MINIMAP_PX_PER_TILE, MINIMAP_PX_PER_TILE, color);
-		}
-	}
-
-	for (int i = 0; i < MAX_ENEMIES; i++) {
-		if (!enemies[i].alive) continue;
-		float ex = ox + enemies[i].x * MINIMAP_PX_PER_TILE;
-		float ey = oy + enemies[i].y * MINIMAP_PX_PER_TILE;
-		C2D_DrawRectSolid(ex - 2.0f, ey - 2.0f, 0.52f, 4.0f, 4.0f, C2D_Color32(255, 60, 60, 255));
-	}
-
-	if (mpRole != MP_OFF) {
-		for (int i = 0; i < MP_MAX_PLAYERS; i++) {
-			if (i == myIdx || !remotePlayers[i].connected || !remotePlayers[i].alive) continue;
-			float rx = ox + remotePlayers[i].x * MINIMAP_PX_PER_TILE;
-			float ry = oy + remotePlayers[i].y * MINIMAP_PX_PER_TILE;
-			C2D_DrawRectSolid(rx - 2.0f, ry - 2.0f, 0.52f, 4.0f, 4.0f, player_color(i));
-		}
-	}
-
-	float pxm = ox + px * MINIMAP_PX_PER_TILE;
-	float pym = oy + py * MINIMAP_PX_PER_TILE;
-	u32 playerColor = C2D_Color32(120, 255, 120, 255);
-	float facingX = pxm + cosf(pa) * 10.0f;
-	float facingY = pym + sinf(pa) * 10.0f;
-	C2D_DrawLine(pxm, pym, playerColor, facingX, facingY, playerColor, 2.0f, 0.53f);
-	C2D_DrawRectSolid(pxm - 2.0f, pym - 2.0f, 0.54f, 4.0f, 4.0f, playerColor);
 }
 
 int main(int argc, char **argv) {
@@ -771,6 +894,12 @@ int main(int argc, char **argv) {
 
 	C2D_SpriteSheet uiSheet = C2D_SpriteSheetLoad("romfs:/gfx/sprites.t3x");
 	C2D_SpriteSheet wallSheet = C2D_SpriteSheetLoad("romfs:/gfx/walltex.t3x");
+	// title.png is a large, full-screen-ish image that doesn't belong
+	// crammed into the small-sprite atlas above -- before being resized
+	// down, it alone was big enough to push the shared atlas past
+	// tex3ds's max page size ("No atlas solution found"). Own standalone
+	// texture instead, same treatment as the wall.
+	C2D_SpriteSheet titleSheet = C2D_SpriteSheetLoad("romfs:/gfx/title.t3x");
 
 	// idle/idle2 alternate as a 2-frame idle animation; fire1/fire2/reset
 	// play once as a 3-frame sequence on each shot; empty is a single
@@ -787,24 +916,22 @@ int main(int argc, char **argv) {
 	C2D_Image imgGunEmpty     = C2D_SpriteSheetGetImage(uiSheet, sprites_empty_idx);
 	C2D_Image imgCrosshair    = C2D_SpriteSheetGetImage(uiSheet, sprites_crosshair_idx);
 	(void)imgCrosshair; // drawing is disabled below until it's aligned to the barrel
-	// Used only for the enemy death effect now -- the gun's own muzzle
-	// flash is baked into the fire1/fire2/reset frames themselves.
-	C2D_Image imgExplosion   = C2D_SpriteSheetGetImage(uiSheet, sprites_explosion_idx);
 	C2D_Image imgHudLoaded    = C2D_SpriteSheetGetImage(uiSheet, sprites_loadedgunonhud_idx);
 	C2D_Image imgHudUnloaded  = C2D_SpriteSheetGetImage(uiSheet, sprites_unloadedgunonhud_idx);
 	C2D_Image imgEnemy        = C2D_SpriteSheetGetImage(uiSheet, sprites_enemy_idx);
-	C2D_Image imgTitle        = C2D_SpriteSheetGetImage(uiSheet, sprites_title_idx);
+	C2D_Image imgTitle        = C2D_SpriteSheetGetImage(titleSheet, title_idx);
 	C2D_Image imgWall         = C2D_SpriteSheetGetImage(wallSheet, walltex_idx);
-	// Top-screen overlay -- vignette + scratched scope glass + center
-	// reticle, drawn as a flat screen-space layer over everything else on
-	// the top screen (not the bottom-screen cartridge icon above, despite
-	// the similar name).
-	C2D_Image imgHudOverlay   = C2D_SpriteSheetGetImage(uiSheet, sprites_hud_idx);
+	// The scope/vignette HUD overlay (gfx/hud.png, gfx/hud.t3s) is on hold
+	// -- not currently loaded or drawn -- until a less obtrusive graphic
+	// replaces it. The asset and its standalone-texture pipeline are still
+	// in place, so wiring it back in later is just re-adding the load +
+	// draw calls.
 
 	C2D_TextBuf textBuf = C2D_TextBufNew(1024);
 
 	GameScreen screen = SCREEN_MENU;
 	Immersion immersion = IMM_BASE;
+	bool paused = false;
 
 	float px = 4.5f, py = 4.5f, pa = 0.0f;
 	int ammo = 0;
@@ -863,6 +990,13 @@ int main(int argc, char **argv) {
 	int mpClientHealth[MP_MAX_PLAYERS]; // host's authoritative HP tracking for each client slot
 	memset(mpClientHealth, 0, sizeof(mpClientHealth));
 	char mpErrorMsg[64] = "";
+	MpMode mpMode = MP_MODE_COOP; // chosen at SCREEN_MP_MENU, host-only choice
+	int mpKills[MP_MAX_PLAYERS];        // versus: host-authoritative per-player kill counts
+	memset(mpKills, 0, sizeof(mpKills));
+	u8 mpRespawnSeq[MP_MAX_PLAYERS];    // versus, host-side: bumped whenever that slot respawns
+	memset(mpRespawnSeq, 0, sizeof(mpRespawnSeq));
+	u8 mpMyLastRespawnSeq = 0;          // versus, client-side: last respawnSeq we've already applied
+	int mpVersusWinnerIdx = -1;         // versus: who won, for the game-over screen (-1 = n/a)
 
 	u64 lastTime = svcGetSystemTick();
 
@@ -876,7 +1010,10 @@ int main(int argc, char **argv) {
 		lastTime = now;
 
 		u32 kDown = hidKeysDown();
-		if (kDown & KEY_START) break;
+		// START quits from every screen except SCREEN_PLAYING, where it
+		// pauses instead (handled in that branch below) -- quitting mid-run
+		// by accident is a much worse mistake than quitting from a menu.
+		if ((kDown & KEY_START) && screen != SCREEN_PLAYING) break;
 
 		if (screen == SCREEN_MENU) {
 			if (kDown & KEY_SELECT) {
@@ -910,14 +1047,22 @@ int main(int argc, char **argv) {
 				FSUSER_CardSlotIsInserted(&prevCardInserted);
 				fireAnimTimer = -1.0f;
 				animClock = 0.0f;
+				paused = false;
 				gunLowerOffset = 0.0f;
 				gunSwayPhase = 0.0f;
 				mpRole = MP_OFF;
+				mpMode = MP_MODE_COOP;
 				screen = SCREEN_PLAYING;
 			}
 		} else if (screen == SCREEN_MP_MENU) {
 			if (kDown & KEY_Y) {
 				screen = SCREEN_MENU;
+			}
+			// Mode only matters to whoever hosts -- a client just inherits
+			// it from PKT_HOST_START -- but it's harmless to let anyone
+			// toggle it here before they know which role they'll take.
+			if (kDown & KEY_SELECT) {
+				mpMode = (mpMode == MP_MODE_COOP) ? MP_MODE_VERSUS : MP_MODE_COOP;
 			}
 			if (kDown & KEY_A) {
 				if (mp_host_create(&mpBindCtx)) {
@@ -926,6 +1071,9 @@ int main(int argc, char **argv) {
 					mpMyNodeID = UDS_HOST_NETWORKNODEID;
 					memset(remotePlayers, 0, sizeof(remotePlayers));
 					memset(mpClientHealth, 0, sizeof(mpClientHealth));
+					memset(mpKills, 0, sizeof(mpKills));
+					memset(mpRespawnSeq, 0, sizeof(mpRespawnSeq));
+					mpVersusWinnerIdx = -1;
 					mpErrorMsg[0] = '\0';
 					screen = SCREEN_MP_LOBBY;
 				} else {
@@ -959,12 +1107,17 @@ int main(int argc, char **argv) {
 					// redundant sends -- UDS isn't guaranteed-delivery, and
 					// this is the one signal every client absolutely must
 					// receive to leave the lobby
-					MpStartPacket startPkt = { PKT_HOST_START };
+					MpStartPacket startPkt = { PKT_HOST_START, (u8)mpMode };
 					for (int i = 0; i < 5; i++) {
 						udsSendTo(UDS_BROADCAST_NETWORKNODEID, MP_DATA_CHANNEL, UDS_SENDFLAG_Default,
 							&startPkt, sizeof(startPkt));
 					}
-					px = 4.5f; py = 4.5f; pa = 0.0f;
+					if (mpMode == MP_MODE_VERSUS) {
+						find_respawn_point(&px, &py);
+					} else {
+						px = 4.5f; py = 4.5f;
+					}
+					pa = 0.0f;
 					health = PLAYER_MAX_HEALTH;
 					wave = 1;
 					kills = 0;
@@ -977,6 +1130,10 @@ int main(int argc, char **argv) {
 					waveTintColor = random_wave_color();
 					memset(enemies, 0, sizeof(enemies));
 					memset(deathEffects, 0, sizeof(deathEffects));
+					memset(mpKills, 0, sizeof(mpKills));
+					memset(mpRespawnSeq, 0, sizeof(mpRespawnSeq));
+					mpMyLastRespawnSeq = 0;
+					mpVersusWinnerIdx = -1;
 					// node_bitmask: bit i is set for NetworkNodeID (i+1), which is
 					// player slot i in our arrays -- this is the actual source of
 					// truth for who's connected right now, since clients don't
@@ -989,6 +1146,12 @@ int main(int argc, char **argv) {
 						remotePlayers[i].connected = connected;
 						remotePlayers[i].alive = connected;
 						mpClientHealth[i] = connected ? PLAYER_MAX_HEALTH : 0;
+						if (mpMode == MP_MODE_VERSUS && connected) {
+							float rx, ry;
+							find_respawn_point(&rx, &ry);
+							remotePlayers[i].x = rx;
+							remotePlayers[i].y = ry;
+						}
 					}
 					magCount = 0;
 					hasLoadedCart = false;
@@ -999,6 +1162,7 @@ int main(int argc, char **argv) {
 					FSUSER_CardSlotIsInserted(&prevCardInserted);
 					fireAnimTimer = -1.0f;
 					animClock = 0.0f;
+					paused = false;
 					gunLowerOffset = 0.0f;
 					gunSwayPhase = 0.0f;
 					mpSendTimer = 0.0f;
@@ -1012,8 +1176,16 @@ int main(int argc, char **argv) {
 				for (int guard = 0; guard < 16; guard++) {
 					Result r = udsPullPacket(&mpBindCtx, buf, sizeof(buf), &actualSize, &srcNodeID);
 					if (R_FAILED(r) || actualSize == 0) break;
-					if (actualSize >= 1 && buf[0] == PKT_HOST_START) {
-						px = 4.5f; py = 4.5f; pa = 0.0f;
+					if (actualSize >= sizeof(MpStartPacket) && buf[0] == PKT_HOST_START) {
+						MpStartPacket startPkt;
+						memcpy(&startPkt, buf, sizeof(startPkt));
+						mpMode = (MpMode)startPkt.mode;
+						if (mpMode == MP_MODE_VERSUS) {
+							find_respawn_point(&px, &py);
+						} else {
+							px = 4.5f; py = 4.5f;
+						}
+						pa = 0.0f;
 						health = PLAYER_MAX_HEALTH;
 						wave = 1;
 						kills = 0;
@@ -1022,6 +1194,8 @@ int main(int argc, char **argv) {
 						memset(enemies, 0, sizeof(enemies));
 						memset(deathEffects, 0, sizeof(deathEffects));
 						memset(remotePlayers, 0, sizeof(remotePlayers));
+						mpMyLastRespawnSeq = 0;
+						mpVersusWinnerIdx = -1;
 						magCount = 0;
 						hasLoadedCart = false;
 						loadedCartId = 0;
@@ -1031,6 +1205,7 @@ int main(int argc, char **argv) {
 						FSUSER_CardSlotIsInserted(&prevCardInserted);
 						fireAnimTimer = -1.0f;
 						animClock = 0.0f;
+						paused = false;
 						gunLowerOffset = 0.0f;
 						gunSwayPhase = 0.0f;
 						mpSendTimer = 0.0f;
@@ -1040,6 +1215,25 @@ int main(int argc, char **argv) {
 				}
 			}
 		} else if (screen == SCREEN_PLAYING) {
+			if (kDown & KEY_START) paused = !paused;
+
+			if (paused) {
+				// Y quits out to the menu from here instead of START, since
+				// START now means "resume" -- everything else (movement,
+				// firing, wave/enemy sim, cart-slot reload, networking) is
+				// simply skipped below while paused.
+				if (kDown & KEY_Y) {
+					if (mpRole == MP_HOST) udsDestroyNetwork();
+					else if (mpRole == MP_CLIENT) udsDisconnectNetwork();
+					if (mpBound) { udsUnbind(&mpBindCtx); mpBound = false; }
+					mpRole = MP_OFF;
+					mpMode = MP_MODE_COOP;
+					mpVersusWinnerIdx = -1;
+					paused = false;
+					screen = SCREEN_MENU;
+				}
+			} else {
+
 			animClock += dt;
 
 			// Circle Pad: move forward/back and strafe left/right.
@@ -1140,13 +1334,26 @@ int main(int argc, char **argv) {
 				play_sound(CH_GUNSHOT, &sounds[CH_GUNSHOT], false);
 
 				if (mpRole == MP_CLIENT) {
-					// the host owns the enemy list in multiplayer -- report
-					// the shot instead of resolving it locally, or the two
-					// would desync
+					// the host owns the enemy/player state in multiplayer --
+					// report the shot instead of resolving it locally, or
+					// things would desync
 					mpPendingFire = true;
+				} else if (mpRole == MP_HOST && mpMode == MP_MODE_VERSUS) {
+					float allX[MP_MAX_PLAYERS], allY[MP_MAX_PLAYERS];
+					bool allAlive[MP_MAX_PLAYERS];
+					allX[0] = px; allY[0] = py; allAlive[0] = health > 0;
+					for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+						allX[p] = remotePlayers[p].x; allY[p] = remotePlayers[p].y;
+						allAlive[p] = remotePlayers[p].connected && mpClientHealth[p] > 0;
+					}
+					int hitIdx = find_versus_hit(allX, allY, allAlive, 0, px, py, pa);
+					if (hitIdx >= 0) {
+						versus_apply_hit(0, hitIdx, &health, &px, &py, mpClientHealth, remotePlayers,
+							mpKills, mpRespawnSeq, deathEffects, &mpVersusWinnerIdx);
+					}
 				} else {
-					// single-player or host: resolve the shot against the
-					// local (and, if hosting, authoritative) enemy list
+					// single-player or co-op host: resolve the shot against
+					// the local (and, if hosting, authoritative) enemy list
 					try_hitscan(enemies, deathEffects, px, py, pa, wave,
 						immersion_score_multiplier(immersion), &kills, &score);
 				}
@@ -1175,11 +1382,14 @@ int main(int argc, char **argv) {
 				if (deathEffects[i].timer <= 0.0f) deathEffects[i].active = false;
 			}
 
-			if (mpRole != MP_CLIENT) {
-				// single-player and host both run the real simulation --
-				// waves, enemy AI, and melee against the local player. Host
-				// additionally does the same against connected remote
-				// players further below.
+			if (mpRole != MP_CLIENT && mpMode == MP_MODE_COOP) {
+				// single-player and co-op host both run the real
+				// simulation -- waves, enemy AI, and melee against the
+				// local player. Host additionally does the same against
+				// connected remote players further below. None of this
+				// applies to versus -- no enemies, no waves, just players
+				// hitting each other (handled where shots are fired,
+				// above).
 				if (waveBreak) {
 					waveBreakTimer -= dt;
 					if (waveBreakTimer <= 0.0f) {
@@ -1269,8 +1479,26 @@ int main(int argc, char **argv) {
 							remotePlayers[idx].x = pkt.px;
 							remotePlayers[idx].y = pkt.py;
 							if (pkt.firing && mpClientHealth[idx] > 0) {
-								try_hitscan(enemies, deathEffects, pkt.px, pkt.py, pkt.pa, wave,
-								immersion_score_multiplier(immersion), &kills, &score);
+								if (mpMode == MP_MODE_VERSUS) {
+									float allX[MP_MAX_PLAYERS], allY[MP_MAX_PLAYERS];
+									bool allAlive[MP_MAX_PLAYERS];
+									allX[0] = px; allY[0] = py; allAlive[0] = health > 0;
+									for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+										allX[p] = remotePlayers[p].x; allY[p] = remotePlayers[p].y;
+										allAlive[p] = remotePlayers[p].connected && mpClientHealth[p] > 0;
+									}
+									int hitIdx = find_versus_hit(allX, allY, allAlive, idx, pkt.px, pkt.py, pkt.pa);
+									if (hitIdx >= 0) {
+										// this is the one legitimate case where a client's
+										// health goes back up from here -- a versus respawn,
+										// not a desync
+										versus_apply_hit(idx, hitIdx, &health, &px, &py, mpClientHealth,
+											remotePlayers, mpKills, mpRespawnSeq, deathEffects, &mpVersusWinnerIdx);
+									}
+								} else {
+									try_hitscan(enemies, deathEffects, pkt.px, pkt.py, pkt.pa, wave,
+										immersion_score_multiplier(immersion), &kills, &score);
+								}
 							}
 						}
 					}
@@ -1280,30 +1508,39 @@ int main(int argc, char **argv) {
 				if (mpSendTimer <= 0.0f) {
 					mpSendTimer = MP_TICK_INTERVAL;
 
-					bool allDead = (health <= 0);
-					for (int p = 1; p < MP_MAX_PLAYERS; p++) {
-						if (remotePlayers[p].connected && mpClientHealth[p] > 0) allDead = false;
+					bool allDead = false;
+					if (mpMode == MP_MODE_COOP) {
+						allDead = (health <= 0);
+						for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+							if (remotePlayers[p].connected && mpClientHealth[p] > 0) allDead = false;
+						}
 					}
+					bool versusWon = (mpMode == MP_MODE_VERSUS && mpVersusWinnerIdx >= 0);
 
 					MpStatePacket statePkt;
 					memset(&statePkt, 0, sizeof(statePkt));
 					statePkt.type = PKT_HOST_STATE;
 					statePkt.wave = (u8)wave;
 					statePkt.waveTintColor = waveTintColor;
-					statePkt.gameOver = allDead ? 1 : 0;
+					statePkt.gameOver = (allDead || versusWon) ? 1 : 0;
 					statePkt.finalWave = (u8)wave;
+					statePkt.versusWinnerIdx = (mpVersusWinnerIdx >= 0) ? (u8)mpVersusWinnerIdx : 0xFF;
 					statePkt.players[0].x = px;
 					statePkt.players[0].y = py;
 					statePkt.players[0].pa = pa;
 					statePkt.players[0].health = (u8)(health > 0 ? health : 0);
 					statePkt.players[0].alive = health > 0 ? 1 : 0;
 					statePkt.players[0].connected = 1;
+					statePkt.players[0].kills = (u8)mpKills[0];
+					statePkt.players[0].respawnSeq = mpRespawnSeq[0];
 					for (int p = 1; p < MP_MAX_PLAYERS; p++) {
 						statePkt.players[p].x = remotePlayers[p].x;
 						statePkt.players[p].y = remotePlayers[p].y;
 						statePkt.players[p].health = (u8)(mpClientHealth[p] > 0 ? mpClientHealth[p] : 0);
 						statePkt.players[p].alive = mpClientHealth[p] > 0 ? 1 : 0;
 						statePkt.players[p].connected = remotePlayers[p].connected ? 1 : 0;
+						statePkt.players[p].kills = (u8)mpKills[p];
+						statePkt.players[p].respawnSeq = mpRespawnSeq[p];
 					}
 					for (int i = 0; i < MAX_ENEMIES; i++) {
 						statePkt.enemies[i].x = enemies[i].x;
@@ -1313,7 +1550,7 @@ int main(int argc, char **argv) {
 					udsSendTo(UDS_BROADCAST_NETWORKNODEID, MP_DATA_CHANNEL, UDS_SENDFLAG_Default,
 						&statePkt, sizeof(statePkt));
 
-					if (allDead) {
+					if (allDead || versusWon) {
 						finalWave = wave;
 						screen = SCREEN_GAMEOVER;
 					}
@@ -1348,13 +1585,26 @@ int main(int argc, char **argv) {
 						int myIdx = mpMyNodeID - 1;
 						if (myIdx >= 0 && myIdx < MP_MAX_PLAYERS) {
 							health = statePkt.players[myIdx].health;
+							// Position is normally self-reported (we're the ones who
+							// told the host where we are), but a versus respawn is
+							// the one case the host has to override it -- checking
+							// for a changed sequence number (rather than a one-shot
+							// flag) means we'll still catch it on a later packet
+							// even if the specific tick it changed on got dropped.
+							if (statePkt.players[myIdx].respawnSeq != mpMyLastRespawnSeq) {
+								px = statePkt.players[myIdx].x;
+								py = statePkt.players[myIdx].y;
+								mpMyLastRespawnSeq = statePkt.players[myIdx].respawnSeq;
+							}
 						}
 						for (int p = 0; p < MP_MAX_PLAYERS; p++) {
 							remotePlayers[p].x = statePkt.players[p].x;
 							remotePlayers[p].y = statePkt.players[p].y;
 							remotePlayers[p].alive = statePkt.players[p].alive != 0;
 							remotePlayers[p].connected = statePkt.players[p].connected != 0;
+							mpKills[p] = statePkt.players[p].kills;
 						}
+						mpVersusWinnerIdx = (statePkt.versusWinnerIdx == 0xFF) ? -1 : (int)statePkt.versusWinnerIdx;
 						if (statePkt.gameOver) {
 							finalWave = statePkt.finalWave;
 							screen = SCREEN_GAMEOVER;
@@ -1362,12 +1612,15 @@ int main(int argc, char **argv) {
 					}
 				}
 			}
+			} // end of "if (!paused)"
 		} else if (screen == SCREEN_GAMEOVER) {
 			if (kDown & KEY_R) {
 				if (mpRole == MP_HOST) udsDestroyNetwork();
 				else if (mpRole == MP_CLIENT) udsDisconnectNetwork();
 				if (mpBound) { udsUnbind(&mpBindCtx); mpBound = false; }
 				mpRole = MP_OFF;
+				mpMode = MP_MODE_COOP;
+				mpVersusWinnerIdx = -1;
 				screen = SCREEN_MENU;
 			}
 		}
@@ -1454,11 +1707,15 @@ int main(int argc, char **argv) {
 			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
 			C2D_SceneBegin(bottom);
 
-			C2D_Text menuText;
-			C2D_TextParse(&menuText, textBuf,
+			char mpMenuLine[128];
+			snprintf(mpMenuLine, sizeof(mpMenuLine),
 				"A: Host a game (up to 4 players)\n"
 				"B: Join a nearby game\n"
-				"Y: back");
+				"SELECT: mode -- %s\n"
+				"Y: back",
+				mpMode == MP_MODE_VERSUS ? "VERSUS" : "CO-OP");
+			C2D_Text menuText;
+			C2D_TextParse(&menuText, textBuf, mpMenuLine);
 			C2D_TextOptimize(&menuText);
 			C2D_DrawText(&menuText, C2D_WithColor, 10.0f, 30.0f, 0.5f, 0.5f, 0.5f,
 				C2D_Color32(220, 220, 220, 255));
@@ -1487,17 +1744,18 @@ int main(int argc, char **argv) {
 
 			char line[64];
 			C2D_Text countText;
-			snprintf(line, sizeof(line), "%d / %d players", constatus.total_nodes, MP_MAX_PLAYERS);
+			snprintf(line, sizeof(line), "%d / %d players -- %s", constatus.total_nodes, MP_MAX_PLAYERS,
+				mpMode == MP_MODE_VERSUS ? "VERSUS" : "CO-OP");
 			C2D_TextParse(&countText, textBuf, line);
 			C2D_TextOptimize(&countText);
-			C2D_DrawText(&countText, C2D_WithColor, 100.0f, 120.0f, 0.5f, 0.6f, 0.6f,
+			C2D_DrawText(&countText, C2D_WithColor, 60.0f, 120.0f, 0.5f, 0.6f, 0.6f,
 				C2D_Color32(255, 255, 255, 255));
 
 			C2D_TargetClear(topRight, C2D_Color32(10, 10, 20, 255));
 			C2D_SceneBegin(topRight);
 			C2D_DrawText(&titleText, C2D_WithColor, 100.0f, 60.0f, 0.5f, 1.0f, 1.0f,
 				C2D_Color32(120, 255, 160, 255));
-			C2D_DrawText(&countText, C2D_WithColor, 100.0f, 120.0f, 0.5f, 0.6f, 0.6f,
+			C2D_DrawText(&countText, C2D_WithColor, 60.0f, 120.0f, 0.5f, 0.6f, 0.6f,
 				C2D_Color32(255, 255, 255, 255));
 
 			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
@@ -1553,26 +1811,37 @@ int main(int argc, char **argv) {
 			// direction for near depth (matches how your eyes naturally
 			// converge on something close in real life). Getting this
 			// backwards is what produced the reversed, nauseating effect.
+			C2D_Text pausedText, pausedHintText;
+			if (paused) {
+				C2D_TextBufClear(textBuf);
+				C2D_TextParse(&pausedText, textBuf, "PAUSED");
+				C2D_TextOptimize(&pausedText);
+				C2D_TextParse(&pausedHintText, textBuf, "START: resume   Y: quit to menu");
+				C2D_TextOptimize(&pausedHintText);
+			}
 			for (int eye = 0; eye < 2; eye++) {
 				C3D_RenderTarget *eyeTarget = (eye == 0) ? top : topRight;
 				float eyeSign = (eye == 0) ? 1.0f : -1.0f;
 
 				C2D_TargetClear(eyeTarget, C2D_Color32(10, 10, 15, 255));
 				C2D_SceneBegin(eyeTarget);
+				draw_floor(imgWall, eyeSign, slider3d);
 				draw_frame(px, py, pa, imgWall, waveTintColor, eyeSign, slider3d);
 				draw_enemies(enemies, px, py, pa, imgEnemy, enemiesFlipped, eyeSign, slider3d);
-				draw_death_effects(deathEffects, px, py, pa, imgExplosion, eyeSign, slider3d);
+				draw_death_effects(deathEffects, px, py, pa, eyeSign, slider3d);
 				if (mpRole != MP_OFF) draw_remote_players(remotePlayers, myIdx, px, py, pa, eyeSign, slider3d);
 
 				// No separate muzzle-flash overlay -- the fire1/fire2/reset
 				// frames already show it as part of the gun sprite itself.
 				C2D_DrawImageAt(gunImg, gunDrawX, gunDrawY, 0.6f, NULL, gunScale, gunScale);
 
-				// HUD overlay drawn last (topmost, over the gun too) -- it's
-				// a flat screen-space layer already sized to exactly fill
-				// the top screen, same identical draw for both eyes as the
-				// gun above.
-				C2D_DrawImageAt(imgHudOverlay, 0.0f, 0.0f, 0.65f, NULL, 1.0f, 1.0f);
+				if (paused) {
+					C2D_DrawRectSolid(0.0f, 0.0f, 0.7f, (float)SCREEN_W, (float)SCREEN_H, C2D_Color32(0, 0, 0, 140));
+					C2D_DrawText(&pausedText, C2D_WithColor, 140.0f, 90.0f, 0.71f, 1.5f, 1.5f,
+						C2D_Color32(255, 255, 255, 255));
+					C2D_DrawText(&pausedHintText, C2D_WithColor, 55.0f, 140.0f, 0.71f, 0.5f, 0.5f,
+						C2D_Color32(200, 200, 200, 255));
+				}
 			}
 
 			// crosshair hidden for now -- it's not lined up with the barrel yet.
@@ -1586,8 +1855,6 @@ int main(int argc, char **argv) {
 
 			C2D_Image hudImg = cardInserted ? imgHudLoaded : imgHudUnloaded;
 			C2D_DrawImageAt(hudImg, 10.0f, 10.0f, 0.5f, NULL, 1.0f, 1.0f);
-
-			draw_minimap(px, py, pa, enemies, mpRole, remotePlayers, myIdx);
 
 			C2D_TextBufClear(textBuf);
 
@@ -1610,7 +1877,11 @@ int main(int argc, char **argv) {
 			C2D_DrawText(&statusText, C2D_WithColor, 10.0f, 110.0f, 0.5f, 0.6f, 0.6f, statusColor);
 
 			C2D_Text statsText;
-			if (mpRole == MP_OFF) {
+			if (mpRole != MP_OFF && mpMode == MP_MODE_VERSUS) {
+				int myKills = (myIdx >= 0 && myIdx < MP_MAX_PLAYERS) ? mpKills[myIdx] : 0;
+				snprintf(line, sizeof(line), "HP %d/%d   Kills %d/%d   %s", health, PLAYER_MAX_HEALTH,
+					myKills, VERSUS_KILL_TARGET, mpRole == MP_HOST ? "HOST" : "CLIENT");
+			} else if (mpRole == MP_OFF) {
 				snprintf(line, sizeof(line), "Wave %d   HP %d/%d   Score %d", wave, health,
 					PLAYER_MAX_HEALTH, score);
 			} else {
@@ -1641,24 +1912,40 @@ int main(int argc, char **argv) {
 			C2D_TextParse(&helpText, textBuf,
 				"Circle Pad: move/strafe   C-Stick/Y+A: look   R: fire\n"
 				"Pull the Game Card to reload, reinsert to chamber.\n"
-				"START: quit");
+				"START: pause");
 			C2D_TextOptimize(&helpText);
 			C2D_DrawText(&helpText, C2D_WithColor, 10.0f, 180.0f, 0.5f, 0.4f, 0.4f,
 				C2D_Color32(180, 180, 180, 255));
 		} else { // SCREEN_GAMEOVER
+			bool versusOver = (mpRole != MP_OFF && mpMode == MP_MODE_VERSUS);
+			int myIdx = (mpRole == MP_OFF) ? -1 : (int)mpMyNodeID - 1;
+
 			C2D_TargetClear(top, C2D_Color32(20, 10, 10, 255));
 			C2D_SceneBegin(top);
 			C2D_TextBufClear(textBuf);
 
+			char line[64];
 			C2D_Text overText;
-			C2D_TextParse(&overText, textBuf, "GAME OVER");
+			C2D_TextParse(&overText, textBuf, versusOver
+				? ((mpVersusWinnerIdx == myIdx) ? "YOU WIN!" : "GAME OVER")
+				: "GAME OVER");
 			C2D_TextOptimize(&overText);
 			C2D_DrawText(&overText, C2D_WithColor, 100.0f, 80.0f, 0.5f, 1.2f, 1.2f,
 				C2D_Color32(255, 120, 120, 255));
 
-			char line[64];
 			C2D_Text waveText;
-			snprintf(line, sizeof(line), "You reached wave %d", finalWave);
+			if (versusOver) {
+				if (mpVersusWinnerIdx == 0) {
+					snprintf(line, sizeof(line), "Host wins with %d kills", VERSUS_KILL_TARGET);
+				} else if (mpVersusWinnerIdx > 0) {
+					snprintf(line, sizeof(line), "Player %d wins with %d kills",
+						mpVersusWinnerIdx + 1, VERSUS_KILL_TARGET);
+				} else {
+					snprintf(line, sizeof(line), "Match ended");
+				}
+			} else {
+				snprintf(line, sizeof(line), "You reached wave %d", finalWave);
+			}
 			C2D_TextParse(&waveText, textBuf, line);
 			C2D_TextOptimize(&waveText);
 			C2D_DrawText(&waveText, C2D_WithColor, 90.0f, 140.0f, 0.5f, 0.55f, 0.55f,
@@ -1674,19 +1961,35 @@ int main(int argc, char **argv) {
 			C2D_TargetClear(bottom, C2D_Color32(0, 0, 0, 255));
 			C2D_SceneBegin(bottom);
 
-			C2D_Text scoreText;
-			snprintf(line, sizeof(line), "Score: %d", score);
-			C2D_TextParse(&scoreText, textBuf, line);
-			C2D_TextOptimize(&scoreText);
-			C2D_DrawText(&scoreText, C2D_WithColor, 10.0f, 20.0f, 0.5f, 0.7f, 0.7f,
-				C2D_Color32(255, 220, 120, 255));
+			if (versusOver) {
+				C2D_Text scoreboardText;
+				char board[160];
+				int n = 0;
+				n += snprintf(board + n, sizeof(board) - n, "Kills\n");
+				n += snprintf(board + n, sizeof(board) - n, "Host: %d\n", mpKills[0]);
+				for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+					if (!remotePlayers[p].connected && p != myIdx) continue;
+					n += snprintf(board + n, sizeof(board) - n, "Player %d: %d\n", p + 1, mpKills[p]);
+				}
+				C2D_TextParse(&scoreboardText, textBuf, board);
+				C2D_TextOptimize(&scoreboardText);
+				C2D_DrawText(&scoreboardText, C2D_WithColor, 10.0f, 20.0f, 0.5f, 0.55f, 0.55f,
+					C2D_Color32(255, 255, 255, 255));
+			} else {
+				C2D_Text scoreText;
+				snprintf(line, sizeof(line), "Score: %d", score);
+				C2D_TextParse(&scoreText, textBuf, line);
+				C2D_TextOptimize(&scoreText);
+				C2D_DrawText(&scoreText, C2D_WithColor, 10.0f, 20.0f, 0.5f, 0.7f, 0.7f,
+					C2D_Color32(255, 220, 120, 255));
 
-			C2D_Text killsText;
-			snprintf(line, sizeof(line), "Kills: %d   Mode: %s", kills, immersion_name(immersion));
-			C2D_TextParse(&killsText, textBuf, line);
-			C2D_TextOptimize(&killsText);
-			C2D_DrawText(&killsText, C2D_WithColor, 10.0f, 65.0f, 0.5f, 0.55f, 0.55f,
-				C2D_Color32(255, 255, 255, 255));
+				C2D_Text killsText;
+				snprintf(line, sizeof(line), "Kills: %d   Mode: %s", kills, immersion_name(immersion));
+				C2D_TextParse(&killsText, textBuf, line);
+				C2D_TextOptimize(&killsText);
+				C2D_DrawText(&killsText, C2D_WithColor, 10.0f, 65.0f, 0.5f, 0.55f, 0.55f,
+					C2D_Color32(255, 255, 255, 255));
+			}
 
 			C2D_Text retryText;
 			C2D_TextParse(&retryText, textBuf, "R: return to menu\nSTART: quit");
@@ -1711,6 +2014,7 @@ int main(int argc, char **argv) {
 	C2D_TextBufDelete(textBuf);
 	C2D_SpriteSheetFree(wallSheet);
 	C2D_SpriteSheetFree(uiSheet);
+	C2D_SpriteSheetFree(titleSheet);
 	C2D_Fini();
 	C3D_Fini();
 	romfsExit();
