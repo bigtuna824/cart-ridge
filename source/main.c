@@ -17,6 +17,7 @@
 #include "title.h"
 #include "hud.h"
 #include "sky.h"
+#include "floor.h"
 
 #define SCREEN_W       400
 #define SCREEN_H       240
@@ -47,12 +48,6 @@
 #define STEREO_STRIP_OVERLAP_PX (2.0f * STEREO_MAX_SHIFT_PX + 2.0f)
 #define STEREO_STRENGTH_PX   35.0f
 #define PI             3.14159265359f
-// Screen pixels the floor scrolls per world tile of camera-lateral
-// movement, at 1 tile of distance -- divided by each band's own distance,
-// so closer bands sweep past faster than distant ones, the same "near
-// things move quicker" parallax cue real floor-casting gives you. Tuned
-// by feel, not derived from anything.
-#define FLOOR_SCROLL_PX_PER_TILE 120.0f
 #define MOVE_SPEED     2.2f   // map tiles per second
 #define TURN_SPEED     2.6f   // radians per second
 #define MAX_DEPTH      20.0f
@@ -693,60 +688,23 @@ static void draw_sky(C2D_Image img) {
 // A genuine per-pixel floor cast (sampling the texture separately for
 // every screen pixel below the horizon) isn't practical here -- citro2d
 // draws whole images, not individual texels, and the draw-call budget is
-// already tight just from the wall strips above (see RENDER_STRIDE). This
-// approximates a floor instead: a handful of horizontal bands, each
-// tiled with the wall texture at a fixed on-screen tile width (not
-// stretched to fill the whole screen in one draw -- that was the earlier
-// bug, see below) and darkened/warmed more the closer a band is to the
-// horizon (farther away).
-#define FLOOR_BANDS 8
-#define FLOOR_TILE_WIDTH_PX 100.0f
-
-// Earlier version drew one copy of the wall texture stretched across the
-// full screen width per band, with no dependency on facing angle or
-// position at all -- so it never moved, full stop, regardless of how
-// much you turned or walked, which read as a frozen/static "plaid"
-// backdrop instead of a floor. This version tiles at a fixed width and
-// scrolls each band using the player's world position projected onto
-// the camera's own right axis (-sin(pa), cos(pa)) -- a single scalar
-// that changes with both turning (the axis itself rotates) and walking
-// (px/py move), so unlike the turning-only version this animates while
-// walking in a straight line too. Scaled by each band's own distance so
-// close bands sweep past faster than far ones (the same "near things
-// move quicker" cue real floor-casting gives you).
-static void draw_floor(C2D_Image wallImg, float px, float py, float pa, float eyeSign, float slider3d) {
+// already tight just from the wall strips above (see RENDER_STRIDE).
+// Distance-scrolled versions of this (angle-only, then angle+position)
+// both ended up looking worse than just embracing the same trick used
+// for the sky: a fixed, non-scrolling tiled backdrop. Given the
+// engine's real limits, a static floor reads as a deliberate stylistic
+// choice instead of a broken one -- same reasoning as the static
+// starfield, just applied below the horizon instead of above it.
+static void draw_floor(C2D_Image img) {
 	float horizon = SCREEN_H / 2.0f;
-	float bandHeight = (SCREEN_H - horizon) / (float)FLOOR_BANDS;
-	float scaleX = FLOOR_TILE_WIDTH_PX / (float)wallImg.subtex->width;
+	float scale = horizon / (float)img.subtex->height; // uniform, matches draw_sky
+	float tileWidth = scale * (float)img.subtex->width;
 
-	for (int i = 0; i < FLOOR_BANDS; i++) {
-		float y0 = horizon + i * bandHeight;
-		float midY = y0 + bandHeight * 0.5f;
-		float dist = (SCREEN_H / 2.0f) / (midY - SCREEN_H / 2.0f);
-		if (dist > MAX_DEPTH) dist = MAX_DEPTH;
-
-		// darker and warmer (orange-toward-brown) than a wall at the same
-		// distance would be -- floor should read as clearly "underfoot",
-		// not just a dimmer wall -- fading further toward the horizon
-		float darken = 0.68f + 0.28f * (dist / MAX_DEPTH);
-		if (darken > 0.95f) darken = 0.95f;
-		C2D_ImageTint tint;
-		C2D_PlainImageTint(&tint, C2D_Color32(70, 35, 10, 255), darken);
-
-		float scaleY = bandHeight / (float)wallImg.subtex->height;
-
-		float rightX = -sinf(pa), rightY = cosf(pa);
-		float lateralPos = px * rightX + py * rightY;
-		float scrollX = fmodf(lateralPos * (FLOOR_SCROLL_PX_PER_TILE / dist), FLOOR_TILE_WIDTH_PX);
-		if (scrollX < 0.0f) scrollX += FLOOR_TILE_WIDTH_PX;
-		float stereoOffset = eyeSign * stereo_shift_px(dist, slider3d);
-
-		for (int t = -1; t < 8; t++) {
-			float x = t * FLOOR_TILE_WIDTH_PX - scrollX + stereoOffset;
-			if (x > (float)SCREEN_W) break;
-			if (x + FLOOR_TILE_WIDTH_PX < 0.0f) continue;
-			C2D_DrawImageAt(wallImg, x, y0, 0.4f, &tint, scaleX, scaleY);
-		}
+	for (int t = -1; t < 8; t++) {
+		float x = t * tileWidth;
+		if (x > (float)SCREEN_W) break;
+		if (x + tileWidth < 0.0f) continue;
+		C2D_DrawImageAt(img, x, horizon, 0.4f, NULL, scale, scale);
 	}
 }
 
@@ -1004,6 +962,7 @@ int main(int argc, char **argv) {
 	// texture instead, same treatment as the wall.
 	C2D_SpriteSheet titleSheet = C2D_SpriteSheetLoad("romfs:/gfx/title.t3x");
 	C2D_SpriteSheet skySheet = C2D_SpriteSheetLoad("romfs:/gfx/sky.t3x");
+	C2D_SpriteSheet floorSheet = C2D_SpriteSheetLoad("romfs:/gfx/floor.t3x");
 
 	// idle/idle2 alternate as a 2-frame idle animation; fire1/fire2/reset
 	// play once as a 3-frame sequence on each shot; empty is a single
@@ -1044,6 +1003,7 @@ int main(int argc, char **argv) {
 	C2D_Image imgTitle        = C2D_SpriteSheetGetImage(titleSheet, title_idx);
 	C2D_Image imgWall         = C2D_SpriteSheetGetImage(wallSheet, walltex_idx);
 	C2D_Image imgSky          = C2D_SpriteSheetGetImage(skySheet, sky_idx);
+	C2D_Image imgFloor        = C2D_SpriteSheetGetImage(floorSheet, floor_idx);
 	// The scope/vignette HUD overlay (gfx/hud.png, gfx/hud.t3s) is on hold
 	// -- not currently loaded or drawn -- until a less obtrusive graphic
 	// replaces it. The asset and its standalone-texture pipeline are still
@@ -2010,7 +1970,7 @@ int main(int argc, char **argv) {
 				C2D_TargetClear(eyeTarget, C2D_Color32(10, 10, 15, 255));
 				C2D_SceneBegin(eyeTarget);
 				draw_sky(imgSky);
-				draw_floor(imgWall, px, py, pa, eyeSign, slider3d);
+				draw_floor(imgFloor);
 				draw_frame(px, py, pa, imgWall, waveTintColor, eyeSign, slider3d);
 				draw_enemies(enemies, px, py, pa, imgEnemy, enemyIdleFlip, eyeSign, slider3d);
 				draw_death_effects(deathEffects, px, py, pa, eyeSign, slider3d);
