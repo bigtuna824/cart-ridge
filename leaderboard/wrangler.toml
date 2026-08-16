@@ -1,0 +1,8 @@
+name = "cart-ridge-leaderboard"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cart-ridge-leaderboard"
+database_id = "e396cb07-2812-4e39-9868-8e769e7dc14b"
