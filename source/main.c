@@ -35,27 +35,24 @@
 #define STEREO_CONVERGE_DIST 2.5f
 #define STEREO_MAX_SHIFT_PX  6.0f
 // Wall strips are rendered independently (RENDER_STRIDE pixels wide) and
-// each now gets its own depth-based shift, so where depth changes from one
-// strip to the next -- a receding wall, a corner -- adjacent strips can
-// end up shifted by different amounts and leave a thin gap between them.
-// Drawing each strip a bit wider than it needs to be (and centered on its
-// shifted position) makes strips overlap slightly instead, hiding that gap.
-// Keep this small: it only needs to cover the sub-pixel-to-a-couple-pixel
-// shift difference between adjacent strips on an ordinary continuous
-// surface. At a genuine depth discontinuity (an actual corner) the shift
-// difference is much bigger, and overlap can't hide that without smearing
-// one strip's texture past the corner -- which reads as seeing a sliver of
-// the other eye's view, since that's exactly where the two eyes differ
-// most. A wider value trades more hidden gaps for worse corner smearing.
-#define STEREO_STRIP_OVERLAP_PX 1.5f
+// each gets its own depth-based stereo shift, so where depth changes from
+// one strip to the next -- a receding wall, a corner -- adjacent strips
+// can end up shifted by different amounts and leave a thin gap between
+// them. Drawing each strip wider than it needs to be (and centered on its
+// shifted position) makes strips overlap instead, hiding that gap. This is
+// wide enough to cover the worst case (two adjacent strips shifted the
+// full STEREO_MAX_SHIFT_PX in opposite directions) so no gap survives even
+// at a genuine corner -- 3D isn't the priority right now, so a little
+// texture smearing at corners is a fine trade for never seeing a seam.
+#define STEREO_STRIP_OVERLAP_PX (2.0f * STEREO_MAX_SHIFT_PX + 2.0f)
 #define STEREO_STRENGTH_PX   35.0f
 #define PI             3.14159265359f
-// Screen pixels the floor scrolls per radian of turning, at 1 tile of
-// distance -- divided by each band's own distance, so closer bands sweep
-// past faster than distant ones, the same "near things move quicker"
-// parallax cue real floor-casting gives you. Tuned by feel, not derived
-// from anything.
-#define FLOOR_SCROLL_PX_PER_RADIAN 250.0f
+// Screen pixels the floor scrolls per world tile of camera-lateral
+// movement, at 1 tile of distance -- divided by each band's own distance,
+// so closer bands sweep past faster than distant ones, the same "near
+// things move quicker" parallax cue real floor-casting gives you. Tuned
+// by feel, not derived from anything.
+#define FLOOR_SCROLL_PX_PER_TILE 120.0f
 #define MOVE_SPEED     2.2f   // map tiles per second
 #define TURN_SPEED     2.6f   // radians per second
 #define MAX_DEPTH      20.0f
@@ -710,14 +707,14 @@ static void draw_sky(C2D_Image img) {
 // position at all -- so it never moved, full stop, regardless of how
 // much you turned or walked, which read as a frozen/static "plaid"
 // backdrop instead of a floor. This version tiles at a fixed width and
-// scrolls each band with facing angle, scaled by that band's own
-// distance so close bands sweep past faster than far ones (the same
-// "near things move quicker" cue real floor-casting gives you). Turning
-// now visibly animates it; walking in a straight line without turning
-// still won't (that would need genuine per-column position tracking,
-// not just a per-band angle scroll) -- a real but smaller gap than the
-// "doesn't move at all" bug this replaces.
-static void draw_floor(C2D_Image wallImg, float pa, float eyeSign, float slider3d) {
+// scrolls each band using the player's world position projected onto
+// the camera's own right axis (-sin(pa), cos(pa)) -- a single scalar
+// that changes with both turning (the axis itself rotates) and walking
+// (px/py move), so unlike the turning-only version this animates while
+// walking in a straight line too. Scaled by each band's own distance so
+// close bands sweep past faster than far ones (the same "near things
+// move quicker" cue real floor-casting gives you).
+static void draw_floor(C2D_Image wallImg, float px, float py, float pa, float eyeSign, float slider3d) {
 	float horizon = SCREEN_H / 2.0f;
 	float bandHeight = (SCREEN_H - horizon) / (float)FLOOR_BANDS;
 	float scaleX = FLOOR_TILE_WIDTH_PX / (float)wallImg.subtex->width;
@@ -738,7 +735,9 @@ static void draw_floor(C2D_Image wallImg, float pa, float eyeSign, float slider3
 
 		float scaleY = bandHeight / (float)wallImg.subtex->height;
 
-		float scrollX = fmodf(pa * (FLOOR_SCROLL_PX_PER_RADIAN / dist), FLOOR_TILE_WIDTH_PX);
+		float rightX = -sinf(pa), rightY = cosf(pa);
+		float lateralPos = px * rightX + py * rightY;
+		float scrollX = fmodf(lateralPos * (FLOOR_SCROLL_PX_PER_TILE / dist), FLOOR_TILE_WIDTH_PX);
 		if (scrollX < 0.0f) scrollX += FLOOR_TILE_WIDTH_PX;
 		float stereoOffset = eyeSign * stereo_shift_px(dist, slider3d);
 
@@ -2011,7 +2010,7 @@ int main(int argc, char **argv) {
 				C2D_TargetClear(eyeTarget, C2D_Color32(10, 10, 15, 255));
 				C2D_SceneBegin(eyeTarget);
 				draw_sky(imgSky);
-				draw_floor(imgWall, pa, eyeSign, slider3d);
+				draw_floor(imgWall, px, py, pa, eyeSign, slider3d);
 				draw_frame(px, py, pa, imgWall, waveTintColor, eyeSign, slider3d);
 				draw_enemies(enemies, px, py, pa, imgEnemy, enemyIdleFlip, eyeSign, slider3d);
 				draw_death_effects(deathEffects, px, py, pa, eyeSign, slider3d);
