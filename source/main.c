@@ -50,10 +50,12 @@
 #define STEREO_STRIP_OVERLAP_PX 1.5f
 #define STEREO_STRENGTH_PX   35.0f
 #define PI             3.14159265359f
-// Screen pixels the sky scrolls per radian of turning. Tuned by feel, not
-// derived from anything -- it just wants to feel like a natural pan, not
-// tied to any real angular unit the way the raycast projection is.
-#define SKY_SCROLL_PX_PER_RADIAN 250.0f
+// Screen pixels the floor scrolls per radian of turning, at 1 tile of
+// distance -- divided by each band's own distance, so closer bands sweep
+// past faster than distant ones, the same "near things move quicker"
+// parallax cue real floor-casting gives you. Tuned by feel, not derived
+// from anything.
+#define FLOOR_SCROLL_PX_PER_RADIAN 250.0f
 #define MOVE_SPEED     2.2f   // map tiles per second
 #define TURN_SPEED     2.6f   // radians per second
 #define MAX_DEPTH      20.0f
@@ -62,11 +64,48 @@
 
 #define MAX_ENEMIES         16
 #define PLAYER_MAX_HEALTH   5
-#define ENEMY_SPEED         1.0f   // tiles per second
-#define ENEMY_MELEE_RANGE   0.5f
+#define ENEMY_SPEED         1.0f   // tiles per second -- baseline, see EnemyStats below
+#define ENEMY_MELEE_RANGE   0.5f   // baseline contact range -- see EnemyStats below
+#define ENEMY_RANGED_RANGE  6.0f   // DS: max hitscan attack range
 #define ENEMY_SPAWN_MIN_DIST 3.0f  // don't spawn closer than this to the player
 #define ENEMY_AIM_TOLERANCE 0.15f  // radians -- forgiving hitscan cone
-#define ENEMY_FLIP_PERIOD   0.3f   // seconds per flip half-cycle (walk animation)
+#define ENEMY_FLIP_PERIOD   0.3f   // seconds per idle1/idle2 frame swap
+// How long the attack/bite frame shows (and the enemy holds still) each
+// time it attacks, and the minimum gap between attacks after that --
+// without a cooldown, standing in an enemy's range would deal damage
+// every single frame, which is obviously not intended.
+#define ENEMY_ATTACK_ANIM_DURATION 0.3f
+#define ENEMY_ATTACK_COOLDOWN      1.2f
+
+// Five enemy types, one per Nintendo cartridge, each with different
+// stats/behavior (see the per-type notes on ENEMY_STATS below). Only
+// Switch dies from its own attack (it detonates); the rest keep
+// attacking on a cooldown until the player kills them.
+typedef enum { ENEMY_GB, ENEMY_GBA, ENEMY_DS, ENEMY_N3DS, ENEMY_SWITCH, ENEMY_TYPE_COUNT } EnemyType;
+
+typedef struct {
+	float speed;        // tiles per second
+	int   maxHealth;    // hits to kill
+	int   attackDamage; // damage dealt per successful attack
+	float triggerRange; // melee/AOE/detonate contact range, or DS's firing range
+	float sizeMult;     // rendered height multiplier (baseline enemy used 0.5f)
+} EnemyStats;
+
+static const EnemyStats ENEMY_STATS[ENEMY_TYPE_COUNT] = {
+	// Game Boy -- slow, tanky (2 hits to kill), hits hard in melee
+	[ENEMY_GB]     = { ENEMY_SPEED * 0.6f,  2, 2, ENEMY_MELEE_RANGE,        0.5f  },
+	// Game Boy Advance -- area-of-effect: a wider trigger range that (see
+	// the sim loop) can catch every nearby player at once, not just one
+	[ENEMY_GBA]    = { ENEMY_SPEED,         1, 1, ENEMY_MELEE_RANGE * 2.4f, 0.5f  },
+	// DS -- barely moves, but attacks at range (hitscan) instead of
+	// needing to close to melee distance
+	[ENEMY_DS]     = { ENEMY_SPEED * 0.25f, 1, 1, ENEMY_RANGED_RANGE,       0.5f  },
+	// 3DS -- the baseline: standard speed/health/damage, melee only
+	[ENEMY_N3DS]   = { ENEMY_SPEED,         1, 1, ENEMY_MELEE_RANGE,        0.5f  },
+	// Switch -- faster, smaller, and the one type that detonates (dies)
+	// on its own attack, dealing more damage than a standard melee hit
+	[ENEMY_SWITCH] = { ENEMY_SPEED * 1.6f,  1, 2, ENEMY_MELEE_RANGE * 1.3f, 0.35f },
+};
 
 #define MAX_DEATH_EFFECTS     8
 #define DEATH_EFFECT_DURATION 0.8f
@@ -158,7 +197,7 @@ typedef struct {
 		// packet that still carries the new number, not only the first.
 		u8 respawnSeq;
 	} players[MP_MAX_PLAYERS];
-	struct { float x, y; u8 alive; } enemies[MAX_ENEMIES];
+	struct { float x, y; u8 alive; u8 type; } enemies[MAX_ENEMIES];
 } MpStatePacket;
 
 typedef struct { u8 type; u8 mode; } MpStartPacket; // PKT_HOST_START
@@ -207,7 +246,14 @@ typedef enum {
 	SCREEN_MENU, SCREEN_MP_MENU, SCREEN_MP_LOBBY, SCREEN_PLAYING, SCREEN_GAMEOVER
 } GameScreen;
 
-typedef struct { float x, y; bool alive; } Enemy;
+typedef struct {
+	float x, y;
+	bool alive;
+	EnemyType type;
+	int health;
+	float attackTimer;    // >0 while the attack frame is showing / attack is resolving
+	float attackCooldown; // >0 while waiting to attack again
+} Enemy;
 
 // A turquoise blood-splatter particle burst on enemy death. Each droplet's
 // direction/travel-distance/size is randomized once at spawn (not
@@ -456,9 +502,14 @@ static void spawn_enemy(Enemy* enemies, float px, float py) {
 		if (wall_is_solid(ex, ey)) continue;
 		float ddx = (ex + 0.5f) - px, ddy = (ey + 0.5f) - py;
 		if (ddx * ddx + ddy * ddy < ENEMY_SPAWN_MIN_DIST * ENEMY_SPAWN_MIN_DIST) continue;
+		EnemyType type = (EnemyType)(rand() % ENEMY_TYPE_COUNT);
 		enemies[slot].x = ex + 0.5f;
 		enemies[slot].y = ey + 0.5f;
 		enemies[slot].alive = true;
+		enemies[slot].type = type;
+		enemies[slot].health = ENEMY_STATS[type].maxHealth;
+		enemies[slot].attackTimer = 0.0f;
+		enemies[slot].attackCooldown = 0.0f;
 		return;
 	}
 }
@@ -511,10 +562,13 @@ static void try_hitscan(Enemy* enemies, DeathEffect* effects, float fx, float fy
 		bestIdx = i;
 	}
 	if (bestIdx >= 0) {
-		enemies[bestIdx].alive = false;
-		if (kills) (*kills)++;
-		if (score) *score += SCORE_PER_KILL * wave * scoreMult;
-		spawn_death_effect(effects, enemies[bestIdx].x, enemies[bestIdx].y);
+		enemies[bestIdx].health--;
+		if (enemies[bestIdx].health <= 0) {
+			enemies[bestIdx].alive = false;
+			if (kills) (*kills)++;
+			if (score) *score += SCORE_PER_KILL * wave * scoreMult;
+			spawn_death_effect(effects, enemies[bestIdx].x, enemies[bestIdx].y);
+		}
 	}
 }
 
@@ -612,26 +666,21 @@ static float stereo_shift_px(float dist, float slider3d) {
 
 // No real 3D geometry exists in this engine to wrap a texture around (it's
 // a 2D raycaster, not a true 3D pipeline) -- so instead of an actual
-// skybox mesh, the sky is a texture tiled above the horizon that scrolls
-// horizontally with the player's facing angle, the same trick classic
-// raycasters (Doom, Duke3D) used for skies. Scaled uniformly (not
-// stretched) so the stars stay round and don't blur out, then tiled
-// side by side -- draws only as many copies as are actually needed to
-// cover the screen at the current scroll offset, which is normally 3
-// given how much smaller than SCREEN_W one tile is. No stereo shift: at
-// "infinite" distance a real stereo camera pair would show zero
-// parallax between the two eyes anyway, so unlike everything else this
-// one is both simpler AND more correct with no per-eye offset at all.
-static void draw_sky(C2D_Image img, float pa) {
+// skybox mesh, the sky is a texture tiled above the horizon. Deliberately
+// static (doesn't scroll with facing angle) as a visual style choice --
+// the stars stay fixed in place while everything else moves. Scaled
+// uniformly (not stretched) so the stars stay round and don't blur out.
+// No stereo shift either: at "infinite" distance a real stereo camera
+// pair would show zero parallax between the two eyes anyway, so unlike
+// everything else this one is both simpler AND more correct with no
+// per-eye offset at all.
+static void draw_sky(C2D_Image img) {
 	float horizon = SCREEN_H / 2.0f;
 	float scale = horizon / (float)img.subtex->height; // uniform -- keeps stars circular
 	float tileWidth = scale * (float)img.subtex->width;
 
-	float scrollX = fmodf(pa * SKY_SCROLL_PX_PER_RADIAN, tileWidth);
-	if (scrollX < 0.0f) scrollX += tileWidth;
-
 	for (int t = -1; t < 8; t++) {
-		float x = t * tileWidth - scrollX;
+		float x = t * tileWidth;
 		if (x > (float)SCREEN_W) break; // this and every later tile are off the right edge
 		if (x + tileWidth < 0.0f) continue; // this one's off the left edge, but a later one may not be
 		C2D_DrawImageAt(img, x, 0.0f, 0.2f, NULL, scale, scale);
@@ -648,34 +697,57 @@ static void draw_sky(C2D_Image img, float pa) {
 // every screen pixel below the horizon) isn't practical here -- citro2d
 // draws whole images, not individual texels, and the draw-call budget is
 // already tight just from the wall strips above (see RENDER_STRIDE). This
-// approximates a floor instead: a handful of horizontal bands, each the
-// wall texture stretched across the full screen width, darkened more the
-// closer a band is to the horizon (farther away). Not perspective-correct
-// per column, but cheap (FLOOR_BANDS draw calls per eye) and still reads
-// as a textured, shaded floor rather than a flat color.
+// approximates a floor instead: a handful of horizontal bands, each
+// tiled with the wall texture at a fixed on-screen tile width (not
+// stretched to fill the whole screen in one draw -- that was the earlier
+// bug, see below) and darkened/warmed more the closer a band is to the
+// horizon (farther away).
 #define FLOOR_BANDS 8
+#define FLOOR_TILE_WIDTH_PX 100.0f
 
-static void draw_floor(C2D_Image wallImg, float eyeSign, float slider3d) {
+// Earlier version drew one copy of the wall texture stretched across the
+// full screen width per band, with no dependency on facing angle or
+// position at all -- so it never moved, full stop, regardless of how
+// much you turned or walked, which read as a frozen/static "plaid"
+// backdrop instead of a floor. This version tiles at a fixed width and
+// scrolls each band with facing angle, scaled by that band's own
+// distance so close bands sweep past faster than far ones (the same
+// "near things move quicker" cue real floor-casting gives you). Turning
+// now visibly animates it; walking in a straight line without turning
+// still won't (that would need genuine per-column position tracking,
+// not just a per-band angle scroll) -- a real but smaller gap than the
+// "doesn't move at all" bug this replaces.
+static void draw_floor(C2D_Image wallImg, float pa, float eyeSign, float slider3d) {
 	float horizon = SCREEN_H / 2.0f;
 	float bandHeight = (SCREEN_H - horizon) / (float)FLOOR_BANDS;
+	float scaleX = FLOOR_TILE_WIDTH_PX / (float)wallImg.subtex->width;
+
 	for (int i = 0; i < FLOOR_BANDS; i++) {
 		float y0 = horizon + i * bandHeight;
 		float midY = y0 + bandHeight * 0.5f;
 		float dist = (SCREEN_H / 2.0f) / (midY - SCREEN_H / 2.0f);
 		if (dist > MAX_DEPTH) dist = MAX_DEPTH;
 
-		// always noticeably darker than a wall at the same distance would
-		// be (floor should read as clearly "underfoot"), plus it fades
-		// further toward the horizon
-		float darken = 0.55f + 0.35f * (dist / MAX_DEPTH);
-		if (darken > 0.9f) darken = 0.9f;
+		// darker and warmer (orange-toward-brown) than a wall at the same
+		// distance would be -- floor should read as clearly "underfoot",
+		// not just a dimmer wall -- fading further toward the horizon
+		float darken = 0.68f + 0.28f * (dist / MAX_DEPTH);
+		if (darken > 0.95f) darken = 0.95f;
 		C2D_ImageTint tint;
-		C2D_PlainImageTint(&tint, C2D_Color32(0, 0, 0, 255), darken);
+		C2D_PlainImageTint(&tint, C2D_Color32(70, 35, 10, 255), darken);
 
-		float scaleX = (float)SCREEN_W / (float)wallImg.subtex->width;
 		float scaleY = bandHeight / (float)wallImg.subtex->height;
-		float drawX = eyeSign * stereo_shift_px(dist, slider3d);
-		C2D_DrawImageAt(wallImg, drawX, y0, 0.4f, &tint, scaleX, scaleY);
+
+		float scrollX = fmodf(pa * (FLOOR_SCROLL_PX_PER_RADIAN / dist), FLOOR_TILE_WIDTH_PX);
+		if (scrollX < 0.0f) scrollX += FLOOR_TILE_WIDTH_PX;
+		float stereoOffset = eyeSign * stereo_shift_px(dist, slider3d);
+
+		for (int t = -1; t < 8; t++) {
+			float x = t * FLOOR_TILE_WIDTH_PX - scrollX + stereoOffset;
+			if (x > (float)SCREEN_W) break;
+			if (x + FLOOR_TILE_WIDTH_PX < 0.0f) continue;
+			C2D_DrawImageAt(wallImg, x, y0, 0.4f, &tint, scaleX, scaleY);
+		}
 	}
 }
 
@@ -776,9 +848,11 @@ static float billboard_screen_x(float relAngle) {
 	return SCREEN_W * (relAngle + FOV / 2.0f) / FOV;
 }
 
-static void draw_enemies(Enemy* enemies, float px, float py, float pa, C2D_Image img, bool flipped,
-		float eyeSign, float slider3d) {
-	float aspect = (float)img.subtex->width / (float)img.subtex->height;
+// imgs[type][frame]: frame 0/1 are the idle1/idle2 alternation (idleFlip
+// picks between them), frame 2 is the attack pose, shown while attackTimer
+// is running so the player gets a visible cue right before taking a hit.
+static void draw_enemies(Enemy* enemies, float px, float py, float pa,
+		C2D_Image imgs[ENEMY_TYPE_COUNT][3], bool idleFlip, float eyeSign, float slider3d) {
 	for (int i = 0; i < MAX_ENEMIES; i++) {
 		if (!enemies[i].alive) continue;
 
@@ -790,8 +864,12 @@ static void draw_enemies(Enemy* enemies, float px, float py, float pa, C2D_Image
 		if (fabsf(relAngle) > FOV / 2.0f + 0.3f) continue; // cheap off-screen cull
 		if (!has_line_of_sight(px, py, enemies[i].x, enemies[i].y)) continue;
 
+		int frame = (enemies[i].attackTimer > 0.0f) ? 2 : (idleFlip ? 1 : 0);
+		C2D_Image img = imgs[enemies[i].type][frame];
+		float aspect = (float)img.subtex->width / (float)img.subtex->height;
+
 		float screenX = billboard_screen_x(relAngle);
-		float height = (SCREEN_H / dist) * 0.5f;
+		float height = (SCREEN_H / dist) * ENEMY_STATS[enemies[i].type].sizeMult;
 		float scale = height / (float)img.subtex->height;
 		float halfWidth = (height * aspect) / 2.0f;
 
@@ -800,16 +878,9 @@ static void draw_enemies(Enemy* enemies, float px, float py, float pa, C2D_Image
 		C2D_ImageTint tint;
 		C2D_PlainImageTint(&tint, C2D_Color32(0, 0, 0, 255), 1.0f - shade);
 
-		// citro2d's flip (negative scaleX) is a pure UV swap inside a quad
-		// whose geometry is always sized from fabs(scale) -- the quad's
-		// screen position never changes based on sign. So the draw
-		// position is the same either way; only the scale sign flips.
-		// This also means it flips around the sprite's own center, not
-		// an edge, which is what we want.
 		float drawX = screenX - halfWidth + eyeSign * stereo_shift_px(dist, slider3d);
-		float drawScaleX = flipped ? -scale : scale;
 		C2D_DrawImageAt(img, drawX, SCREEN_H / 2.0f - height / 2.0f, 0.52f, &tint,
-			drawScaleX, scale);
+			scale, scale);
 	}
 }
 
@@ -948,13 +1019,29 @@ int main(int argc, char **argv) {
 		C2D_SpriteSheetGetImage(uiSheet, sprites_reset_idx),
 	};
 	C2D_Image imgGunEmpty     = C2D_SpriteSheetGetImage(uiSheet, sprites_empty_idx);
-	C2D_Image imgCrosshair    = C2D_SpriteSheetGetImage(uiSheet, sprites_crosshair_idx);
-	(void)imgCrosshair; // drawing is disabled below until it's aligned to the barrel
 	// The bottom-screen cartridge-status icon (loadedgunonhud.png /
 	// unloadedgunonhud.png) is off for now while a new sprite replaces it.
 	// Still compiled into the atlas (a new C2D_Image + draw call is all
 	// that's needed to bring it back once the new art is ready).
-	C2D_Image imgEnemy        = C2D_SpriteSheetGetImage(uiSheet, sprites_enemy_idx);
+	// One idle1/idle2/attack triple per cartridge type, indexed
+	// [EnemyType][0=idle1, 1=idle2, 2=attack] -- see EnemyStats/draw_enemies.
+	C2D_Image imgEnemy[ENEMY_TYPE_COUNT][3] = {
+		[ENEMY_GB]     = { C2D_SpriteSheetGetImage(uiSheet, sprites_gb_idle1_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_gb_idle2_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_gb_attack_idx) },
+		[ENEMY_GBA]    = { C2D_SpriteSheetGetImage(uiSheet, sprites_gba_idle1_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_gba_idle2_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_gba_attack_idx) },
+		[ENEMY_DS]     = { C2D_SpriteSheetGetImage(uiSheet, sprites_ds_idle1_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_ds_idle2_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_ds_attack_idx) },
+		[ENEMY_N3DS]   = { C2D_SpriteSheetGetImage(uiSheet, sprites_n3ds_idle1_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_n3ds_idle2_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_n3ds_attack_idx) },
+		[ENEMY_SWITCH] = { C2D_SpriteSheetGetImage(uiSheet, sprites_switch_idle1_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_switch_idle2_idx),
+		                    C2D_SpriteSheetGetImage(uiSheet, sprites_switch_attack_idx) },
+	};
 	C2D_Image imgTitle        = C2D_SpriteSheetGetImage(titleSheet, title_idx);
 	C2D_Image imgWall         = C2D_SpriteSheetGetImage(wallSheet, walltex_idx);
 	C2D_Image imgSky          = C2D_SpriteSheetGetImage(skySheet, sky_idx);
@@ -1458,44 +1545,98 @@ int main(int argc, char **argv) {
 					if (!waveDamageTaken) score += SCORE_NO_DAMAGE_WAVE * wave * scoreMult;
 				}
 
+				// One unified per-type loop: tick attack timers/cooldowns, let
+				// each enemy attack (type-specific range/target/effect) if its
+				// cooldown has expired, and otherwise move it toward the local
+				// player. Only Switch dies from its own attack (see
+				// ENEMY_STATS/EnemyType) -- everything else just keeps
+				// threatening whoever it hit until the player kills it.
 				for (int i = 0; i < MAX_ENEMIES; i++) {
 					if (!enemies[i].alive) continue;
+
+					if (enemies[i].attackTimer > 0.0f) enemies[i].attackTimer -= dt;
+					if (enemies[i].attackCooldown > 0.0f) enemies[i].attackCooldown -= dt;
+
+					EnemyType type = enemies[i].type;
+					const EnemyStats* stats = &ENEMY_STATS[type];
+
 					float dx = px - enemies[i].x, dy = py - enemies[i].y;
-					float dist = sqrtf(dx * dx + dy * dy);
-					if (dist < ENEMY_MELEE_RANGE) {
-						enemies[i].alive = false;
-						health--;
-						waveDamageTaken = true;
-						spawn_death_effect(deathEffects, enemies[i].x, enemies[i].y);
+					float distLocal = sqrtf(dx * dx + dy * dy);
+					bool attacked = false;
+
+					if (enemies[i].attackCooldown <= 0.0f) {
+						if (type == ENEMY_DS) {
+							// hitscan -- needs line of sight, doesn't need to close to melee range
+							if (distLocal > 0.001f && distLocal <= stats->triggerRange &&
+									has_line_of_sight(enemies[i].x, enemies[i].y, px, py)) {
+								health -= stats->attackDamage;
+								waveDamageTaken = true;
+								attacked = true;
+							}
+						} else if (type == ENEMY_GBA) {
+							// area-of-effect -- can catch the local player and,
+							// if we're the host, every connected remote player
+							// in range in the same pass
+							if (distLocal < stats->triggerRange) {
+								health -= stats->attackDamage;
+								waveDamageTaken = true;
+								attacked = true;
+							}
+							if (mpRole == MP_HOST) {
+								for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+									if (!remotePlayers[p].connected || mpClientHealth[p] <= 0) continue;
+									float rdx = remotePlayers[p].x - enemies[i].x, rdy = remotePlayers[p].y - enemies[i].y;
+									if (sqrtf(rdx * rdx + rdy * rdy) < stats->triggerRange) {
+										mpClientHealth[p] -= stats->attackDamage;
+										remotePlayers[p].alive = mpClientHealth[p] > 0;
+										attacked = true;
+									}
+								}
+							}
+						} else {
+							// GB / N3DS / Switch -- single-target contact attack;
+							// local player takes priority, remote players are only
+							// checked (host-side) when the local player's out of range
+							if (distLocal < stats->triggerRange) {
+								health -= stats->attackDamage;
+								waveDamageTaken = true;
+								attacked = true;
+							} else if (mpRole == MP_HOST) {
+								for (int p = 1; p < MP_MAX_PLAYERS; p++) {
+									if (!remotePlayers[p].connected || mpClientHealth[p] <= 0) continue;
+									float rdx = remotePlayers[p].x - enemies[i].x, rdy = remotePlayers[p].y - enemies[i].y;
+									if (sqrtf(rdx * rdx + rdy * rdy) < stats->triggerRange) {
+										mpClientHealth[p] -= stats->attackDamage;
+										remotePlayers[p].alive = mpClientHealth[p] > 0;
+										attacked = true;
+										break;
+									}
+								}
+							}
+						}
+					}
+
+					if (attacked) {
+						enemies[i].attackTimer = ENEMY_ATTACK_ANIM_DURATION;
+						enemies[i].attackCooldown = ENEMY_ATTACK_COOLDOWN;
+						if (type == ENEMY_SWITCH) {
+							enemies[i].alive = false;
+							spawn_death_effect(deathEffects, enemies[i].x, enemies[i].y);
+						}
 						if (health <= 0 && mpRole == MP_OFF) {
 							finalWave = wave;
 							screen = SCREEN_GAMEOVER;
 						}
 						continue;
 					}
-					float mvx = dx / dist * ENEMY_SPEED * dt;
-					float mvy = dy / dist * ENEMY_SPEED * dt;
-					float newX = enemies[i].x + mvx;
-					float newY = enemies[i].y + mvy;
-					if (!wall_is_solid((int)newX, (int)enemies[i].y)) enemies[i].x = newX;
-					if (!wall_is_solid((int)enemies[i].x, (int)newY)) enemies[i].y = newY;
-				}
 
-				if (mpRole == MP_HOST) {
-					// melee against connected remote players
-					for (int i = 0; i < MAX_ENEMIES; i++) {
-						if (!enemies[i].alive) continue;
-						for (int p = 1; p < MP_MAX_PLAYERS; p++) {
-							if (!remotePlayers[p].connected || mpClientHealth[p] <= 0) continue;
-							float dx = remotePlayers[p].x - enemies[i].x, dy = remotePlayers[p].y - enemies[i].y;
-							if (sqrtf(dx * dx + dy * dy) < ENEMY_MELEE_RANGE) {
-								enemies[i].alive = false;
-								mpClientHealth[p]--;
-								remotePlayers[p].alive = mpClientHealth[p] > 0;
-								spawn_death_effect(deathEffects, enemies[i].x, enemies[i].y);
-								break;
-							}
-						}
+					if (distLocal > 0.001f) {
+						float mvx = dx / distLocal * stats->speed * dt;
+						float mvy = dy / distLocal * stats->speed * dt;
+						float newX = enemies[i].x + mvx;
+						float newY = enemies[i].y + mvy;
+						if (!wall_is_solid((int)newX, (int)enemies[i].y)) enemies[i].x = newX;
+						if (!wall_is_solid((int)enemies[i].x, (int)newY)) enemies[i].y = newY;
 					}
 				}
 			}
@@ -1589,6 +1730,7 @@ int main(int argc, char **argv) {
 						statePkt.enemies[i].x = enemies[i].x;
 						statePkt.enemies[i].y = enemies[i].y;
 						statePkt.enemies[i].alive = enemies[i].alive ? 1 : 0;
+						statePkt.enemies[i].type = (u8)enemies[i].type;
 					}
 					udsSendTo(UDS_BROADCAST_NETWORKNODEID, MP_DATA_CHANNEL, UDS_SENDFLAG_Default,
 						&statePkt, sizeof(statePkt));
@@ -1624,6 +1766,7 @@ int main(int argc, char **argv) {
 							enemies[i].x = statePkt.enemies[i].x;
 							enemies[i].y = statePkt.enemies[i].y;
 							enemies[i].alive = statePkt.enemies[i].alive != 0;
+							enemies[i].type = (EnemyType)statePkt.enemies[i].type;
 						}
 						int myIdx = mpMyNodeID - 1;
 						if (myIdx >= 0 && myIdx < MP_MAX_PLAYERS) {
@@ -1812,7 +1955,7 @@ int main(int argc, char **argv) {
 			C2D_DrawText(&promptText, C2D_WithColor, 10.0f, 30.0f, 0.5f, 0.45f, 0.45f,
 				C2D_Color32(220, 220, 220, 255));
 		} else if (screen == SCREEN_PLAYING) {
-			bool enemiesFlipped = fmodf(animClock, ENEMY_FLIP_PERIOD * 2.0f) >= ENEMY_FLIP_PERIOD;
+			bool enemyIdleFlip = fmodf(animClock, ENEMY_FLIP_PERIOD * 2.0f) >= ENEMY_FLIP_PERIOD;
 			int myIdx = (mpRole == MP_OFF) ? -1 : (int)mpMyNodeID - 1;
 
 			// top screen: the raycast view + enemies + other players + viewmodel,
@@ -1867,10 +2010,10 @@ int main(int argc, char **argv) {
 
 				C2D_TargetClear(eyeTarget, C2D_Color32(10, 10, 15, 255));
 				C2D_SceneBegin(eyeTarget);
-				draw_sky(imgSky, pa);
-				draw_floor(imgWall, eyeSign, slider3d);
+				draw_sky(imgSky);
+				draw_floor(imgWall, pa, eyeSign, slider3d);
 				draw_frame(px, py, pa, imgWall, waveTintColor, eyeSign, slider3d);
-				draw_enemies(enemies, px, py, pa, imgEnemy, enemiesFlipped, eyeSign, slider3d);
+				draw_enemies(enemies, px, py, pa, imgEnemy, enemyIdleFlip, eyeSign, slider3d);
 				draw_death_effects(deathEffects, px, py, pa, eyeSign, slider3d);
 				if (mpRole != MP_OFF) draw_remote_players(remotePlayers, myIdx, px, py, pa, eyeSign, slider3d);
 
@@ -1886,11 +2029,6 @@ int main(int argc, char **argv) {
 						C2D_Color32(200, 200, 200, 255));
 				}
 			}
-
-			// crosshair hidden for now -- it's not lined up with the barrel yet.
-			// float chX = SCREEN_W / 2.0f - imgCrosshair.subtex->width / 2.0f;
-			// float chY = SCREEN_H / 2.0f - imgCrosshair.subtex->height / 2.0f;
-			// C2D_DrawImageAt(imgCrosshair, chX, chY, 0.5f, NULL, 1.0f, 1.0f);
 
 			// bottom screen: ammo, wave/health, controls. The cartridge-status
 			// icon is off for now -- a new sprite is replacing it.
